@@ -30,6 +30,7 @@ import datetime as dt
 
 import requests
 import gspread
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
 try:
@@ -826,13 +827,189 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
                   f'защищены (ещё не доставлены) - не режу')
 
 # ==========================================================================
+# ДОБОР ОПИСАНИЯ ДЛЯ ХАБРА - когда LLM вернула И грейд, И опыт как "не указано"
+# ==========================================================================
+# Причина: в LLM для Хабра уходит только "Должность | Компания | Локация |
+# грейд | вилка" (см. read_raw) - текст требований не собирается, и модель
+# честно упирается в потолок из-за правила "грейд и/или опыт не указаны".
+# Здесь - вторая попытка: идём на страницу вакансии, забираем описание,
+# зовём тот же LLM ещё раз, перезаписываем строку. Отдельная фаза ПОСЛЕ
+# основной записи листа, под своим try - падение добора не должно ронять
+# cleanup_old_rows/style_sheet (см. вызов в main()).
+ENRICH_SOURCE = 'Хабр'
+ENRICH_VERSION_LABEL = 'v2+desc'      # защита от повторного добора той же строки
+ENRICH_MAX_PER_RUN = 25               # не добрали - доберём в следующий прогон
+ENRICH_FETCH_TIMEOUT = 30
+ENRICH_FETCH_PAUSE = 0.4              # пауза между запросами к career.habr.com
+HABR_DESC_SELECTOR = '.vacancy-description__text'
+ENRICH_HEADERS = {'User-Agent': 'Mozilla/5.0 (job-search-personal; vacancy-radar-enrich)'}
+
+def fetch_habr_description(url):
+    """Возвращает (текст, None) при успехе или (None, причина) при неудаче.
+    Причины делятся на 2 категории для лога добора: страница не открылась
+    (сеть/таймаут/статус не 200) и селектор пуст/не найден (страница 200,
+    но .vacancy-description__text не дал текста - нетиповая карточка)."""
+    try:
+        r = requests.get(url, headers=ENRICH_HEADERS, timeout=ENRICH_FETCH_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        return None, f'страница не открылась ({e})'
+    if r.status_code != 200:
+        return None, f'страница не открылась (HTTP {r.status_code})'
+    soup = BeautifulSoup(r.text, 'lxml')
+    el = soup.select_one(HABR_DESC_SELECTOR)
+    text = el.get_text('\n', strip=True) if el else ''
+    if not text:
+        return None, 'селектор пуст'
+    return text, None
+
+def enrich_habr_descriptions(ws, today_rows):
+    """Добор описания для строк Хабра с неизвестными грейдом И опытом.
+    today_rows - {rownum: {...}} строк, записанных В ЭТОМ прогоне (из main()) -
+    если добор попадает в одну из них, обновляет её данные на месте, чтобы
+    notify_top ниже пересобрался с учётом добора (см. вызов в main())."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа «Вакансии» для добора")
+    if len(vals) <= 1:
+        print('  [добор] лист пуст - нечего добирать')
+        return
+
+    src_idx = COLUMNS.index('Источник')
+    grade_idx = COLUMNS.index('Грейд')
+    exp_idx = COLUMNS.index('Опыт (треб.)')
+    ver_idx = COLUMNS.index('Версия промпта')
+    company_idx = COLUMNS.index('Компания')
+    title_idx = COLUMNS.index('Должность')
+    location_idx = COLUMNS.index('Локация')
+    url_idx = COLUMNS.index('Ссылка')
+    score_idx = COLUMNS.index('Оценка')
+    comment_idx = COLUMNS.index('Комментарий')
+    seen_idx = COLUMNS.index('Просмотрено')
+    pub_idx = COLUMNS.index('Опубликовано')
+
+    # Собираем ВСЕХ подходящих кандидатов (без раннего обрыва по лимиту) и
+    # сортируем по дате публикации, свежие первыми, ПЕРЕД тем как резать по
+    # ENRICH_MAX_PER_RUN. Без этого строка, у которой добор стабильно не
+    # удаётся (метка v2+desc не ставится при неудаче - это правильно), могла
+    # бы вечно занимать место в начале очереди и блокировать остальных при
+    # переполнении лимита. Сортировка по дате решает это без счётчика попыток:
+    # неудачник со временем сползает вниз относительно более свежих строк и
+    # через MAX_AGE_DAYS уходит обычной чисткой (cleanup_old_rows). Строки с
+    # нераспознанной датой - в конец очереди, не в начало (parse_date -> None
+    # не должен получать приоритет).
+    dated, undated = [], []
+    for i, row in enumerate(vals[1:], start=2):
+        if len(row) <= ver_idx:
+            continue
+        if row[src_idx] != ENRICH_SOURCE:
+            continue
+        if row[ver_idx] == ENRICH_VERSION_LABEL:
+            continue
+        if row[grade_idx].strip() != 'не указано' or row[exp_idx].strip() != 'не указано':
+            continue
+        d = parse_date(row[pub_idx] if len(row) > pub_idx else '')
+        if d is None:
+            undated.append((i, row))
+        else:
+            dated.append((d, i, row))
+    dated.sort(key=lambda t: t[0], reverse=True)
+    candidates = [(i, row) for _, i, row in dated] + undated
+    candidates = candidates[:ENRICH_MAX_PER_RUN]
+
+    if not candidates:
+        print('  [добор] нечего добирать')
+        return
+    print(f'  [добор] кандидатов: {len(candidates)}')
+
+    last_col = col_to_letter(len(COLUMNS) - 1)
+    ok = 0
+    fail = 0
+    fail_reasons = {}          # 4 категории для итоговой строки
+    is_vacancy_false_count = 0
+
+    for rownum, row in candidates:
+        url = row[url_idx] if len(row) > url_idx else ''
+        title = row[title_idx] if len(row) > title_idx else ''
+        company = row[company_idx] if len(row) > company_idx else ''
+        location = row[location_idx] if len(row) > location_idx else ''
+        old_score = row[score_idx] if len(row) > score_idx else ''
+
+        if not url:
+            fail += 1
+            fail_reasons['страница не открылась (нет ссылки)'] = \
+                fail_reasons.get('страница не открылась (нет ссылки)', 0) + 1
+            continue
+
+        desc, reason = fetch_habr_description(url)
+        time.sleep(ENRICH_FETCH_PAUSE)
+        if desc is None:
+            fail += 1
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+            continue
+
+        text = f"{title} | {company} | {location}\n\n{desc}"
+        data, llm_reason = llm_evaluate(text)
+        if not data:
+            fail += 1
+            bucket = 'ответ LLM не распарсился' if llm_reason == 'LLM битый JSON' \
+                else 'LLM не ответила после ретраев'
+            fail_reasons[bucket] = fail_reasons.get(bucket, 0) + 1
+            continue
+
+        is_vac = str(data.get('is_vacancy', 'true')).strip().lower()
+        if is_vac in ('false', 'нет', '0', 'no'):
+            fail += 1
+            is_vacancy_false_count += 1
+            print(f'    [добор][внимание] {url}: LLM сочла страницу НЕ единичной '
+                  f'вакансией (is_vacancy=false) - проверь, что селектор тянет '
+                  f'описание, а не что-то ещё')
+            continue
+
+        item = {'source_id': row[0], 'src': ENRICH_SOURCE,
+                'published': row[COLUMNS.index('Опубликовано')], 'url': url}
+        new_row = build_row(item, data)
+        new_row[ver_idx] = ENRICH_VERSION_LABEL
+        # сохраняем ручные поля существующей строки - build_row пишет для них ''
+        # (корректно для НОВОЙ строки, но здесь мы перезаписываем существующую)
+        new_row[comment_idx] = row[comment_idx] if len(row) > comment_idx else ''
+        new_row[seen_idx] = row[seen_idx] if len(row) > seen_idx else ''
+
+        target_range = f'A{rownum}:{last_col}{rownum}'
+        with_retry(lambda row=new_row, rng=target_range: ws.update(
+            [row], rng, value_input_option='USER_ENTERED'),
+                  what="перезапись строки после добора")
+
+        new_score = new_row[score_idx]
+        print(f'    [добор] было {old_score} -> стало {new_score}, {title} / {company}')
+        ok += 1
+
+        if rownum in today_rows:
+            try:
+                score_num = float(new_score)
+            except (TypeError, ValueError):
+                score_num = None
+            today_rows[rownum].update({
+                'company': str(data.get('company') or ''),
+                'title': str(data.get('title') or 'вакансия'),
+                'format': str(data.get('format') or ''),
+                'location': str(data.get('location') or ''),
+                'score': score_num,
+            })
+
+    reasons_txt = ', '.join(f'{k}: {v}' for k, v in fail_reasons.items()) or '-'
+    print(f'  [добор] успешно {ok}, не удалось {fail} из {len(candidates)} '
+          f'(причины: {reasons_txt})')
+    if is_vacancy_false_count:
+        print(f'  [добор][внимание] is_vacancy=false у {is_vacancy_false_count} - '
+              f'возможно, селектор {HABR_DESC_SELECTOR} съезжает не туда')
+
+# ==========================================================================
 # Телеграм-счётчик
 # ==========================================================================
 # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (не баг, не чинить вслепую): notify_count зовётся ОДИН
 # раз, после того как весь цикл по todo в main() уже отработал, а запись строки
-# в лист происходит раньше, чем пополнение notify_top. Если процесс упадёт
-# посередине цикла - часть вакансий уже физически в листе (и больше никогда не
-# попадёт в todo/notify_top на будущих прогонах), но notify_count для них в
+# в лист происходит раньше, чем пополнение today_rows (из которого потом
+# собирается notify_top). Если процесс упадёт посередине цикла - часть
+# вакансий уже физически в листе (и больше никогда не попадёт в todo/
+# today_rows на будущих прогонах), но notify_count для них в
 # этом прогоне не вызывался -> личное уведомление по ним теряется навсегда,
 # сама вакансия в листе остаётся видна. Сценарий редкий, осознанно не лечим:
 # таблица - основной канал, уведомление - удобство, а лечение требует переделки
@@ -1102,7 +1279,9 @@ def main():
     num = len(have)
     added = 0
     sheet_rows = ws.row_count   # кэш текущего размера листа для авто-расширения
-    notify_top = []
+    today_rows = {}    # rownum -> данные для notify_top; заполняется на КАЖДУЮ
+                        # записанную сегодня строку, не только прошедшие порог -
+                        # добор ниже может поднять score выше NOTIFY_DETAIL_SCORE
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
     skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
@@ -1151,20 +1330,27 @@ def main():
             fill_row(ws, num + 1, rgb)     # num+1: заголовок row1 + num дозаписанных строк
         added += 1
         print(f'  [{num}] {str(data.get("score","?")):>2}/10 | {str(data.get("company") or "")[:18]:18} | {str(data.get("title") or "")[:40]}')
-        if score_num is not None and score_num >= NOTIFY_DETAIL_SCORE:
-            notify_top.append({
-                'company': str(data.get('company') or ''),
-                'title': str(data.get('title') or 'вакансия'),
-                'format': str(data.get('format') or ''),
-                'location': str(data.get('location') or ''),
-                'url': it['url'],
-                'score': score_num,
-            })
+        today_rows[num + 1] = {
+            'company': str(data.get('company') or ''),
+            'title': str(data.get('title') or 'вакансия'),
+            'format': str(data.get('format') or ''),
+            'location': str(data.get('location') or ''),
+            'url': it['url'],
+            'score': score_num,
+        }
 
     print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
           f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
 
-    notify_top.sort(key=lambda v: v['score'], reverse=True)
+    try:
+        enrich_habr_descriptions(ws, today_rows)
+    except Exception as e:
+        print(f'  [добор] фаза не выполнена: {e}')
+
+    notify_top = sorted(
+        (v for v in today_rows.values()
+         if v['score'] is not None and v['score'] >= NOTIFY_DETAIL_SCORE),
+        key=lambda v: v['score'], reverse=True)
     notify_count(added, notify_top[:10])
     delivered_ids = set()
     try:
