@@ -14,7 +14,9 @@
 Колонки llm_оценка / llm_вердикт заведены пустыми - их заполнит звено 2.
 
 Дедуп по source_id. Ручная колонка "Комментарии" не перезаписывается.
-Первый прогон - глубокий (DEEP_FIRST_RUN); дальше дедуп не даёт задваивать.
+Телеграм: листание вглубь канала останавливается по возрасту поста
+(SOURCE_MAX_AGE_DAYS), не по признаку "первого прогона" - см.
+feed_telegram_channel.
 
 Секретов в коде нет: .env локально / Secrets в облаке.
 """
@@ -77,10 +79,14 @@ TG_CHANNELS = [
 # Убраны как нечитаемые через t.me/s/ (это чаты/группы, не каналы-вещатели):
 #   rabotaICL, products_jobs — смотреть вручную.
 #   jobstobefoundJobs, mtsfintechjobs — unavailable (0 постов, не читаются через t.me/s/).
-# Глубина чтения телеграма:
-DEEP_FIRST_RUN = True     # первый прогон - глубже (листать ленту назад)
-TG_DEEP_PAGES = 8         # сколько "страниц" ленты назад тянуть в глубоком режиме
-TG_SHALLOW_ONLY = False   # True = только текущая страница (свежее), для ежедневных прогонов
+# Глубина чтения телеграма: страницы листаются назад, пока не встретится
+# страница без единого поста моложе SOURCE_MAX_AGE_DAYS (см.
+# feed_telegram_channel) - обычно 1-3 страницы на активный канал, 1 на
+# неактивный. TG_DEEP_PAGES - страховочный потолок страниц на канал (той
+# же природы, что HABR_MAX_PAGES для Хабра), а не основной критерий
+# глубины - предохранитель на случай, если проверка "страница вся
+# старая" почему-то не сработает.
+TG_DEEP_PAGES = 8
 
 SHEET_HABR = 'Хабр'
 SHEET_TG = 'Телеграм'
@@ -238,20 +244,44 @@ def _tg_page(channel, before=None):
 def feed_telegram_channel(channel):
     """
     Возвращает (список RawVacancy, статус_доступности, число постов ДО
-    предфильтра - для детектора аномалий сбора, см. collection_monitor.py).
+    предфильтра, число постов с нераспознанной датой - первое для
+    детектора аномалий сбора, см. collection_monitor.py).
     статус: 'ok' | 'empty' | 'unavailable' (чат/приват/опечатка).
+
+    Отсечка по возрасту (SOURCE_MAX_AGE_DAYS) применяется уже здесь, той
+    же константой, что и cleanup_source - иначе между "уже не собираем"
+    и "ещё не удалили" появляется дыра: карусель постоянной дозаписи и
+    подчистки одних и тех же старых постов (см. диагноз - без отсечки
+    здесь TG_DEEP_PAGES страниц листались на КАЖДОМ прогоне, а не только
+    на условном "первом"). SOURCE_MAX_AGE_DAYS=0 (как и в cleanup_source,
+    см. её докстринг) означает "не отсекать" - без этой проверки ноль
+    здесь означал бы обратное: "отсечь всё", кроме постов ровно за
+    сегодня.
+
+    Посты без распознанной даты НЕ записываются - cleanup_source их не
+    трогает (нераспознанная дата -> не удаляем), такой пост иначе
+    накапливался бы в листе вечно.
+
+    Листание страниц назад по каналу останавливается, как только на
+    очередной странице не нашлось НИ ОДНОГО поста в пределах окна
+    SOURCE_MAX_AGE_DAYS - решение по всей странице целиком (не по
+    первому старому посту), т.к. порядок виджетов в HTML не гарантирован
+    (min_id ниже вычисляется явным сравнением, а не берётся как первый в
+    списке). TG_DEEP_PAGES остаётся страховочным потолком страниц на
+    канал, а не основным критерием остановки.
     """
     out, seen = [], set()
+    undated = 0
     try:
         r = _tg_page(channel)
     except Exception as e:
-        return [], f'unavailable ({e})', 0
+        return [], f'unavailable ({e})', 0, 0
     if r.status_code != 200 or '/s/' not in r.url:
-        return [], 'unavailable (не публичный канал/чат/опечатка)', 0
+        return [], 'unavailable (не публичный канал/чат/опечатка)', 0, 0
 
-    pages = TG_DEEP_PAGES if (DEEP_FIRST_RUN and not TG_SHALLOW_ONLY) else 1
+    today = dt.date.today()
     before = None
-    for _ in range(pages):
+    for _ in range(TG_DEEP_PAGES):
         try:
             resp = _tg_page(channel, before) if before else r
             if before:
@@ -263,6 +293,7 @@ def feed_telegram_channel(channel):
         if not widgets:
             break
         min_id = None
+        any_fresh = False
         for w in widgets:
             data_post = w.get('data-post', '')     # 'channel/1899'
             mid = data_post.split('/')[-1] if data_post else ''
@@ -271,11 +302,18 @@ def feed_telegram_channel(channel):
             seen.add(mid)
             if min_id is None or int(mid) < int(min_id):
                 min_id = mid
-            text_el = w.select_one('.tgme_widget_message_text')
-            text = text_el.get_text('\n', strip=True) if text_el else ''
-            text = clean_tg_text(text)                # срезаем навигацию/рекламу
             date_el = w.select_one('time')
             date = date_el.get('datetime', '')[:10] if date_el else ''
+            pub_date = _parse_pub_date(date)
+            if pub_date is None:
+                undated += 1
+                continue                            # без даты - не пишем (см. докстринг)
+            if SOURCE_MAX_AGE_DAYS and (today - pub_date).days > SOURCE_MAX_AGE_DAYS:
+                continue                            # старше окна сбора - не пишем
+            any_fresh = True
+            text_el = w.select_one('.tgme_widget_message_text')
+            text = text_el.get_text('\n', strip=True) if text_el else ''
+            text = clean_tg_text(text)              # срезаем навигацию/рекламу
             if not text.strip() or not is_product(text):  # cut: только продуктовое
                 continue
             out.append(RawVacancy(
@@ -284,10 +322,10 @@ def feed_telegram_channel(channel):
                 url=f'https://t.me/{channel}/{mid}',
                 raw_text=text, channel=channel,
             ))
-        if TG_SHALLOW_ONLY or not DEEP_FIRST_RUN or not min_id:
+        if not any_fresh or not min_id:
             break
         before = min_id     # листаем ленту дальше в прошлое
-    return out, 'ok', len(seen)
+    return out, 'ok', len(seen), undated
 
 def feed_telegram():
     """Фидер телеграма: все каналы. Битые каналы помечает, не падает.
@@ -296,11 +334,12 @@ def feed_telegram():
     all_v, report = [], []
     total_raw = 0
     for ch in TG_CHANNELS:
-        vacs, status, raw_count = feed_telegram_channel(ch)
+        vacs, status, raw_count, undated_count = feed_telegram_channel(ch)
         report.append((ch, status, len(vacs)))
         all_v.extend(vacs)
         total_raw += raw_count
-        print(f'  [TG] {ch:26} {status:40} постов: {len(vacs)}')
+        extra = f', без даты пропущено: {undated_count}' if undated_count else ''
+        print(f'  [TG] {ch:26} {status:40} постов: {len(vacs)}{extra}')
     return all_v, report, total_raw
 
 # ==========================================================================
