@@ -1,0 +1,21 @@
+name: hh probe
+
+# Разовая проверка доступности hh.ru из GitHub Actions.
+# Запускается только вручную. Ничего не пишет в таблицы и не шлёт сообщений.
+# Секреты не используются.
+
+on: workflow_dispatch
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests
+
+      - run: python hh_probe.py
