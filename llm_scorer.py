@@ -1016,8 +1016,13 @@ def enrich_habr_descriptions(ws, today_rows):
 # уже работающего кода. У рассылки аудитории (notify_audience) от этого же
 # сценария есть защита - персистентный журнал «Аудитория», это разные механизмы.
 def notify_count(n, top=None):
+    """Возвращает True/False - успех отправки. Не бросает исключение (main()
+    зовёт её без try/except, в отличие от notify_audience - падение здесь не
+    должно ронять прогон, лист уже записан, см. ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ выше).
+    До правки requests.post не проверялся вовсе: HTTP 401/403/429/500
+    проходили как успех - requests не бросает исключение на 4xx/5xx сам."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        return
+        return False
     top = top or []
     if top:
         lines = [f'🎯 Вакансии product manager: {len(top)}']
@@ -1033,12 +1038,22 @@ def notify_count(n, top=None):
     else:
         text = 'Пу-пу-пуу, пока тишина 🤷'
     try:
-        requests.post(f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
+        r = requests.post(f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
                       json={'chat_id': TG_CHAT_ID, 'text': text,
                             'parse_mode': 'HTML', 'disable_web_page_preview': True},
                       timeout=30)
     except Exception as e:
-        print(f'  [телеграм] не отправлено: {e}')
+        print(f'  [телеграм] не отправлено (сеть): {e}')
+        return False
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code != 200 or not body.get('ok'):
+        desc = body.get('description') or f'HTTP {r.status_code}'
+        print(f'  [телеграм] не отправлено: {desc}')
+        return False
+    return True
 
 # ==========================================================================
 # Часть Б - рассылка аудитории (подписчики бота, список берём у воркера)

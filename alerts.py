@@ -24,19 +24,33 @@ TG_CHAT_ID = os.getenv('TG_CHAT_ID', '')
 
 def send_owner_alert(text):
     """Один POST в Телеграм владельцу, без ретраев. Любой сбой - строка в
-    консоль/run.log, исключение наружу не выходит."""
+    консоль/run.log, исключение наружу не выходит (fail-open - см. докстринг
+    модуля). Возвращает True/False - вызывающий код МОЖЕТ проверить успех,
+    но ни один текущий вызов (report_crash/check_collection_anomaly) этого
+    не требует - раньше это была тишина: requests не бросает исключение на
+    4xx/5xx сам по себе, поэтому HTTP 401/403/429/500 проходили как успех."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print(f'[алерт] TG_BOT_TOKEN/TG_CHAT_ID не заданы, алерт не отправлен: {text}')
-        return
+        return False
     try:
         import requests
-        requests.post(
+        r = requests.post(
             f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage',
             json={'chat_id': TG_CHAT_ID, 'text': text, 'disable_web_page_preview': True},
             timeout=15,
         )
     except Exception as e:
-        print(f'[алерт] отправка в телеграм не удалась: {e}')
+        print(f'[алерт] отправка в телеграм не удалась (сеть): {e}')
+        return False
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code != 200 or not body.get('ok'):
+        desc = body.get('description') or f'HTTP {r.status_code}'
+        print(f'[алерт] телеграм отказал: {desc}')
+        return False
+    return True
 
 
 def report_crash(script_name, exc):
