@@ -397,12 +397,27 @@ def existing_ids(ws):
         return set()
     return {row[0] for row in vals[1:] if row and row[0]}
 
+# Значение, начинающееся с одного из этих символов, Google Sheets под
+# USER_ENTERED интерпретирует как формулу (=, +, -) или как чат-функцию (@) -
+# P1.8 аудита. Здесь это особенно прямой канал: v.title/v.company/v.salary/
+# v.location/v.grade - скрейпинг страницы Хабра, v.raw_text - целиком текст
+# поста телеграм-канала, без какой-либо обработки.
+_FORMULA_TRIGGER_CHARS = ('=', '+', '-', '@')
+
+def _sheet_safe(value):
+    """Ведущий апостроф форсирует текстовый тип для ЭТОЙ ячейки, даже под
+    USER_ENTERED - при чтении обратно (get_all_values/get_all_records) не
+    появляется, это сигнал только на ввод, не часть содержимого ячейки."""
+    s = str(value)
+    return "'" + s if s.startswith(_FORMULA_TRIGGER_CHARS) else s
+
 def row_habr(v):
-    return [v.source_id, v.title, v.company, v.salary, v.location, v.grade,
+    return [v.source_id, _sheet_safe(v.title), _sheet_safe(v.company), _sheet_safe(v.salary),
+            _sheet_safe(v.location), _sheet_safe(v.grade),
             v.rating, v.published, v.url, 'актуальна', '', '', '']
 
 def row_tg(v):
-    return [v.source_id, v.channel, v.published, v.raw_text, v.url,
+    return [v.source_id, v.channel, v.published, _sheet_safe(v.raw_text), v.url,
             'актуальна', '', '', '']
 
 def append_new(ws, rows):

@@ -750,20 +750,40 @@ def cleanup_rejected_log(ws):
     except Exception as e:
         print(f'  [отбраковка] журнал: не удалось подчистить: {e}')
 
+# Значение, начинающееся с одного из этих символов, Google Sheets под
+# USER_ENTERED интерпретирует как формулу (=, +, -) или как чат-функцию (@) -
+# P1.8 аудита. Риск реален для полей, эхом несущих внешний текст (пост
+# телеграма, страница Хабра, пересказ LLM) - не для служебных/перечислимых
+# полей (source_id, url, грейд/опыт/формат из фиксированных списков и т.п.),
+# которые физически не могут начинаться с этих символов.
+_FORMULA_TRIGGER_CHARS = ('=', '+', '-', '@')
+
+def _sheet_safe(value):
+    """Ведущий апостроф форсирует текстовый тип для ЭТОЙ ячейки, даже под
+    USER_ENTERED - тот же приём, которым это делает вручную человек в
+    интерфейсе Sheets. При чтении обратно (get_all_values/get_all_records,
+    ValueRenderOption.formatted по умолчанию в gspread) апостроф в
+    результате не появляется - это сигнал только на ввод, не часть
+    содержимого ячейки, поэтому дописывать его заново при перезаписи
+    (добор) не нужно."""
+    s = str(value)
+    return "'" + s if s.startswith(_FORMULA_TRIGGER_CHARS) else s
+
 def build_row(item, data):
     def g(key, default='не указано'):
         v = data.get(key)
         return v if v not in (None, '') else default
-    company = g('company')
+    company = _sheet_safe(g('company'))
     grade = pick(data.get('grade'), V_GRADE)
     exp = pick(data.get('experience'), V_EXP)
     fmt = pick(data.get('format'), V_FORMAT)
     verdict = str(g('verdict', ''))
     if len(verdict) > 200:                       # ровные строки: длинный вердикт обрезаем
         verdict = verdict[:200].rstrip() + '…'
+    verdict = _sheet_safe(verdict)
     return [
-        item['source_id'], company, g('title'),
-        exp, grade, item['src'], fmt, g('salary'), g('location'),
+        item['source_id'], company, _sheet_safe(g('title')),
+        exp, grade, item['src'], fmt, _sheet_safe(g('salary')), _sheet_safe(g('location')),
         g('score', ''), verdict,
         item['published'], item['url'], '', '',
         PROMPT_VERSION,
