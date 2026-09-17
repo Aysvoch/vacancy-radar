@@ -80,6 +80,16 @@ NOTIFY_DETAIL_SCORE = 5   # >= этого идёт в бот (в таблицу 
 # всё ещё больше - обрезаем лишние снизу (см. cleanup_old_rows).
 MAX_ROWS = 150
 
+# P1.5 аудита: полный (или почти полный) отказ LLM выглядит как обычная
+# "тишина" - "записано 0" зелёным, подписчикам/владельцу "вакансий нет".
+# Порог доли ошибок в todo, начиная с которого это ГОРАЗДО правдоподобнее
+# отказ OpenRouter/модели, чем реальное отсутствие вакансий - 2 ошибки из
+# 39 (~5%) это обычный сетевой шум, 39 из 39 (100%) явный отказ; 0.5 -
+# заведомая середина между ними. При маленьком todo (< LLM_ERROR_MIN_SAMPLE)
+# процент ненадёжен - требуем именно 100% отказа, не долю.
+LLM_ERROR_RATE_ALERT = 0.5
+LLM_ERROR_MIN_SAMPLE = 5
+
 # ==========================================================================
 # ЧАСТЬ Б - рассылка аудитории через телеграм-бот (воркер Cloudflare)
 # ==========================================================================
@@ -1716,6 +1726,16 @@ def main():
     print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
           f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
 
+    # P1.5 аудита: отличаем "оценили всё, ничего не прошло" (genuine тишина)
+    # от "не смогли оценить" (отказ LLM). См. LLM_ERROR_RATE_ALERT выше.
+    llm_outage = bool(todo) and (
+        (len(todo) >= LLM_ERROR_MIN_SAMPLE and llm_errors / len(todo) >= LLM_ERROR_RATE_ALERT)
+        or llm_errors == len(todo)
+    )
+    if llm_outage:
+        print(f'  [LLM] похоже на отказ LLM, не на тишину: {llm_errors}/{len(todo)} '
+              f'вакансий не удалось оценить за этот прогон')
+
     try:
         append_rejected(ws_rejected, new_rejections)
     except Exception as e:
@@ -1730,7 +1750,12 @@ def main():
         (v for v in today_rows.values()
          if v['score'] is not None and v['score'] >= NOTIFY_DETAIL_SCORE),
         key=lambda v: v['score'], reverse=True)
-    notify_count(added, notify_top[:10])
+    if llm_outage and not notify_top:
+        # нечего показать, а причина - вероятный отказ LLM, не genuine тишина.
+        # "Пу-пу-пуу, пока тишина" здесь была бы ложной - не шлём её.
+        print('  [LLM] владельцу не отправляю "тишина" - похоже на отказ LLM, не на отсутствие вакансий')
+    else:
+        notify_count(added, notify_top[:10])
     delivered_ids = set()
     try:
         delivered_ids = notify_audience(gc, ss_raw, ws) or set()
@@ -1741,6 +1766,19 @@ def main():
     style_sheet(ws, total_rows)
     print(f'\nЗвено 2 готово. Оценено и записано: {added}. Прогон: {dt.date.today().isoformat()}')
     print(f'Модель: {LLM_MODEL}')
+
+    if llm_outage:
+        # ПОСЛЕ всех обычных шагов (лист записан, добор/рассылка/подчистка/
+        # оформление уже отработали как в любом другом прогоне) - красим
+        # прогон красным в CI, чтобы отказ LLM не остался незамеченным.
+        # Текст явно говорит, что пайплайн ДОШЁЛ до конца - иначе "прогон
+        # упал" в алерте от report_crash читается как "ничего не сделано".
+        raise SystemExit(
+            f'ЛИСТ ЗАПИСАН, РАССЫЛКА ОТРАБОТАЛА КАК ОБЫЧНО - красный из-за '
+            f'отказа LLM: {llm_errors}/{len(todo)} вакансий не удалось оценить '
+            f'за этот прогон (похоже на отказ OpenRouter/модели, не на '
+            f'отсутствие вакансий).'
+        )
 
 if __name__ == '__main__':
     try:
