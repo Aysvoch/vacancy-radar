@@ -1120,8 +1120,10 @@ def enrich_habr_descriptions(ws, today_rows):
     company_idx = COLUMNS.index('Компания')
     title_idx = COLUMNS.index('Должность')
     location_idx = COLUMNS.index('Локация')
+    salary_idx = COLUMNS.index('ЗП вилка')
     url_idx = COLUMNS.index('Ссылка')
     score_idx = COLUMNS.index('Оценка')
+    verdict_idx = COLUMNS.index('Вердикт')
     comment_idx = COLUMNS.index('Комментарий')
     seen_idx = COLUMNS.index('Просмотрено')
     pub_idx = COLUMNS.index('Опубликовано')
@@ -1186,7 +1188,17 @@ def enrich_habr_descriptions(ws, today_rows):
             fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
             continue
 
-        text = f"{title} | {company} | {location}\n\n{desc}"
+        # Известная вилка с первого (короткого) прохода - передаём её LLM явно.
+        # Без этого повторная оценка видит только title/company/location+описание;
+        # если полное описание не повторяет зарплату текстом (частый случай на
+        # Хабре - вилка показана только в карточке), LLM возвращает salary=
+        # 'не указано', и build_row затирает УЖЕ ИЗВЕСТНОЕ значение (P2.3 аудита).
+        known_salary = row[salary_idx] if len(row) > salary_idx else 'не указано'
+        salary_unknown = _norm(known_salary) in {
+            '', 'не указано', 'не указана', 'зарплата не указана',
+        }
+        salary_hint = f' | вилка {known_salary}' if not salary_unknown else ''
+        text = f"{title} | {company} | {location}{salary_hint}\n\n{desc}"
         data, llm_reason = llm_evaluate(text)
         if not data:
             fail += 1
@@ -1197,17 +1209,77 @@ def enrich_habr_descriptions(ws, today_rows):
 
         is_vac = str(data.get('is_vacancy', 'true')).strip().lower()
         if is_vac in ('false', 'нет', '0', 'no'):
-            fail += 1
+            # Карантин НА МЕСТЕ, без удаления строки (удаление сдвинуло бы номера
+            # оставшихся кандидатов в этом же цикле - тот же класс бага, что P1.2).
+            # Более полные данные (полное описание) уверенно говорят "это не
+            # вакансия" - старую оценку первого (короткого) прохода нельзя
+            # оставлять как есть, она может быть >= порога рассылки (P1.7 аудита).
+            # Метка версии СТАВИТСЯ (в отличие от прочих неудач добора) - это не
+            # временный сбой, а содержательный результат, повторять его на
+            # следующих прогонах незачем.
             is_vacancy_false_count += 1
+            quarantine_row = list(row)
+            while len(quarantine_row) < len(COLUMNS):
+                quarantine_row.append('')
+            quarantine_row[score_idx] = '0'
+            quarantine_row[verdict_idx] = _sheet_safe(
+                'Карантин добора: полное описание оказалось не единичной вакансией (is_vacancy=false)')
+            quarantine_row[ver_idx] = ENRICH_VERSION_LABEL
+            target_range = f'A{rownum}:{last_col}{rownum}'
+            with_retry(lambda row=quarantine_row, rng=target_range: ws.update(
+                [row], rng, value_input_option='USER_ENTERED'),
+                      what="карантин строки после добора (is_vacancy=false)")
             print(f'    [добор][внимание] {url}: LLM сочла страницу НЕ единичной '
-                  f'вакансией (is_vacancy=false) - проверь, что селектор тянет '
-                  f'описание, а не что-то ещё')
+                  f'вакансией (is_vacancy=false) - карантин: оценка обнулена, '
+                  f'из рассылки и повторного добора больше не участвует. '
+                  f'Проверь, что селектор тянет описание, а не что-то ещё')
+            ok += 1
+            if rownum in today_rows:
+                today_rows[rownum]['score'] = 0.0
+            continue
+
+        # P2.3 аудита: если полное описание уверенно понизило score ниже
+        # MIN_SCORE, старую (возможно высокую) оценку оставлять нельзя - она
+        # могла бы уйти в рассылку. Удалять строку внутри цикла тоже нельзя:
+        # сдвинутся номера остальных кандидатов. Поэтому сохраняем фактический
+        # низкий score на месте и ставим финальную метку версии: строка больше
+        # не участвует ни в рассылке, ни в повторном доборе.
+        try:
+            new_score_num = float(data.get('score'))
+        except (TypeError, ValueError):
+            new_score_num = None
+        if new_score_num is not None and new_score_num < MIN_SCORE:
+            quarantine_row = list(row)
+            while len(quarantine_row) < len(COLUMNS):
+                quarantine_row.append('')
+            quarantine_row[score_idx] = new_score_num
+            quarantine_row[verdict_idx] = _sheet_safe(
+                str(data.get('verdict') or
+                    f'Карантин добора: score {new_score_num} ниже MIN_SCORE={MIN_SCORE}'))
+            quarantine_row[ver_idx] = ENRICH_VERSION_LABEL
+            target_range = f'A{rownum}:{last_col}{rownum}'
+            with_retry(lambda row=quarantine_row, rng=target_range: ws.update(
+                [row], rng, value_input_option='USER_ENTERED'),
+                      what="карантин строки после добора (низкий score)")
+            print(f'    [добор] {url}: новый score {new_score_num} < MIN_SCORE={MIN_SCORE} - '
+                  f'старая оценка заменена, строка исключена из рассылки и повторного добора')
+            ok += 1
+            if rownum in today_rows:
+                today_rows[rownum]['score'] = new_score_num
             continue
 
         item = {'source_id': row[0], 'src': ENRICH_SOURCE,
                 'published': row[COLUMNS.index('Опубликовано')], 'url': url}
         new_row = build_row(item, data)
         new_row[ver_idx] = ENRICH_VERSION_LABEL
+        # Передача вилки в prompt помогает модели, но не является гарантией.
+        # Надёжное структурное поле сохраняем явно, если повторная оценка
+        # вернула пустое/неизвестное значение.
+        new_salary_unknown = _norm(new_row[salary_idx]) in {
+            '', 'не указано', 'не указана', 'зарплата не указана',
+        }
+        if not salary_unknown and new_salary_unknown:
+            new_row[salary_idx] = _sheet_safe(known_salary)
         # сохраняем ручные поля существующей строки - build_row пишет для них ''
         # (корректно для НОВОЙ строки, но здесь мы перезаписываем существующую)
         new_row[comment_idx] = row[comment_idx] if len(row) > comment_idx else ''

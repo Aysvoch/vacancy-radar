@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 import requests
 from bs4 import BeautifulSoup
 import gspread
+from gspread.utils import ValueRenderOption
 from google.oauth2.service_account import Credentials
 
 from collection_monitor import check_collection_anomaly
@@ -458,19 +459,46 @@ def append_new(ws, rows):
                 return len(rows)
     return 0
 
+_RU_MONTHS = {
+    'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4,
+    'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
+    'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12,
+}
+
+
+def _serial_to_date(serial):
+    """Sheets/Excel serial number -> date. Некорректное значение -> None."""
+    if isinstance(serial, bool):
+        return None
+    try:
+        number = float(serial)
+    except (TypeError, ValueError):
+        return None
+    # Реальные даты вакансий заведомо лежат после эпохи Sheets. Верхнюю
+    # границу всё равно страхуем try/except: timedelta/datetime не должны
+    # ронять весь прогон из-за ручного мусора в одной ячейке.
+    if not 0 <= number <= 2958465:
+        return None
+    try:
+        return (dt.datetime(1899, 12, 30) + dt.timedelta(days=number)).date()
+    except (OverflowError, ValueError):
+        return None
+
+
 def _parse_pub_date(s):
-    """Парсит дату из 'Опубликовано'. '2026-08-12', '2026-08-12 00:00:00', datetime.
-    Не распознал -> None (строку не трогаем)."""
-    if not s:
+    """Парсит дату из Sheets. Нераспознанное значение -> None."""
+    if s in (None, '') or isinstance(s, bool):
         return None
     if isinstance(s, dt.datetime):
         return s.date()
     if isinstance(s, dt.date):
         return s
+    if isinstance(s, (int, float)):
+        return _serial_to_date(s)
     txt = str(s).strip()
-    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y'):
         try:
-            return dt.datetime.strptime(txt[:len(fmt)+2], fmt).date()
+            return dt.datetime.strptime(txt, fmt).date()
         except ValueError:
             continue
     m = re.match(r'(\d{4})-(\d{2})-(\d{2})', txt)
@@ -479,12 +507,34 @@ def _parse_pub_date(s):
             return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             return None
+    m = re.fullmatch(r'(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?', txt.lower())
+    if m and m.group(2) in _RU_MONTHS:
+        today = dt.date.today()
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            candidate = dt.date(year, _RU_MONTHS[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+        if not m.group(3) and candidate > today:
+            candidate = candidate.replace(year=year - 1)
+        return candidate
     return None
 
 
 def cleanup_source(ws, cols):
     """Удаляет из листа-сборщика строки старше SOURCE_MAX_AGE_DAYS по 'Опубликовано'.
-    Нераспознанная дата -> НЕ трогаем. Никогда не роняет прогон."""
+    Нераспознанная дата -> НЕ трогаем. Никогда не роняет прогон.
+
+    Дату читаем УЗКИМ столбцовым запросом с value_render_option=unformatted,
+    а не общим get_all_values листа (P1.1 аудита). Для настоящей дата-ячейки
+    Sheets возвращает serial number независимо от её отображения: на текущей
+    выгрузке Хабр отформатирован как "d mmmm", а Телеграм как "yyyy-mm-dd".
+    Поэтому проблема уже проявлялась только на Хабре, хотя оба листа содержат
+    дата-значения. Если Sheets оставит значение текстом, _parse_pub_date
+    поддерживает ISO, ДД.ММ.ГГГГ и исходный русский формат "N месяц".
+
+    Ни одна ДРУГАЯ колонка листа (Вилка, Рейтинг, Текст и т.п.) этим
+    запросом не читается и не затрагивается."""
     if not SOURCE_MAX_AGE_DAYS:
         return
     try:
@@ -492,18 +542,19 @@ def cleanup_source(ws, cols):
     except ValueError:
         return
     try:
-        vals = with_retry(lambda: ws.get_all_values(), what="чтение сырья перед подчисткой")
+        col_vals = with_retry(
+            lambda: ws.col_values(pub_idx + 1,
+                                  value_render_option=ValueRenderOption.unformatted),
+            what="чтение дат сырья перед подчисткой")
     except Exception as e:
         print(f'  [подчистка сырья] чтение не удалось: {e}')
         return
-    if len(vals) <= 1:
+    if len(col_vals) <= 1:
         return
     today = dt.date.today()
     to_delete = []
-    for i, row in enumerate(vals[1:], start=2):
-        if len(row) <= pub_idx:
-            continue
-        d = _parse_pub_date(row[pub_idx])
+    for i, raw in enumerate(col_vals[1:], start=2):
+        d = _parse_pub_date(raw)
         if d is not None and (today - d).days > SOURCE_MAX_AGE_DAYS:
             to_delete.append(i)
     if not to_delete:
