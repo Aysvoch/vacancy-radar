@@ -1064,21 +1064,24 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
                   f'защищены (ещё не доставлены) - не режу')
 
 # ==========================================================================
-# ДОБОР ОПИСАНИЯ ДЛЯ ХАБРА - когда LLM вернула И грейд, И опыт как "не указано"
+# ПОЛНОЕ ОПИСАНИЕ ХАБРА И ДОБОР ДЛЯ СТАРЫХ/РЕЗЕРВНЫХ СТРОК
 # ==========================================================================
-# Причина: в LLM для Хабра уходит только "Должность | Компания | Локация |
-# грейд | вилка" (см. read_raw) - текст требований не собирается, и модель
-# честно не может извлечь ни грейд, ни опыт из короткой строки. С v3 это уже
-# не про потолок score (правило-потолок убрано) - это про то, что "Опыт (треб.)"
-# определяет блок в рассылке (см. build_audience_candidates): вакансия с
-# неизвестным опытом не может встать в "Без опыта"/"1-3 года"/"3-6 лет" и без
-# добора уйдёт только в блок "Опыт не указан". Здесь - вторая попытка: идём на
-# страницу вакансии, забираем описание, зовём тот же LLM ещё раз, перезаписываем
-# строку. Отдельная фаза ПОСЛЕ основной записи листа, под своим try - падение
-# добора не должно ронять cleanup_old_rows/style_sheet (см. вызов в main()).
+# Карточка Хабра содержит только должность, компанию, локацию, грейд и вилку.
+# Этого недостаточно для честной оценки роли и требуемого опыта (P2.1 аудита),
+# поэтому для НОВОЙ вакансии полное описание запрашивается ДО первого вызова
+# LLM (prepare_primary_evaluation_text). Если запрос не удался, первая оценка
+# всё равно выполняется по карточке, но отрицательный результат не закрепляется
+# в журнале "Отбраковано": вакансия получит новый шанс в следующем прогоне.
+#
+# Фаза enrich_habr_descriptions ниже остаётся для уже существующих строк и для
+# строк, записанных после резервной оценки по карточке. Она запускается после
+# основной записи под своим try, чтобы её отказ не ронял остальной pipeline.
 ENRICH_SOURCE = 'Хабр'
 ENRICH_VERSION_LABEL = f'{PROMPT_VERSION}+desc'  # следует за PROMPT_VERSION -
                                                    # защита от повторного добора той же строки
+ENRICH_PENDING_LABEL = f'{PROMPT_VERSION}+card'  # оценено только по карточке:
+                                                   # хранить можно, рассылать нельзя,
+                                                   # полное описание надо повторить
 ENRICH_MAX_PER_RUN = 25               # не добрали - доберём в следующий прогон
 ENRICH_FETCH_TIMEOUT = 30
 ENRICH_FETCH_PAUSE = 0.4              # пауза между запросами к career.habr.com
@@ -1103,8 +1106,33 @@ def fetch_habr_description(url):
         return None, 'селектор пуст'
     return text, None
 
+def prepare_primary_evaluation_text(item):
+    """Готовит текст для ПЕРВОЙ оценки.
+
+    Telegram уже несёт полный текст поста. Для Хабра сначала добираем описание
+    страницы, чтобы роль не была необратимо отбракована по одной короткой
+    карточке. Возвращает (текст, описание_получено, причина_неудачи).
+
+    При неудаче возвращается исходный текст карточки: положительный результат
+    можно безопасно записать и позже обогатить, а отрицательный main() не
+    фиксирует в журнале "Отбраковано" и повторит на следующем прогоне.
+    """
+    base_text = str(item.get('text') or '')
+    if item.get('src') != ENRICH_SOURCE:
+        return base_text, False, None
+
+    url = str(item.get('url') or '').strip()
+    if not url:
+        return base_text, False, 'страница не открылась (нет ссылки)'
+
+    desc, reason = fetch_habr_description(url)
+    time.sleep(ENRICH_FETCH_PAUSE)
+    if desc is None:
+        return base_text, False, reason
+    return f'{base_text}\n\n{desc}', True, None
+
 def enrich_habr_descriptions(ws, today_rows):
-    """Добор описания для строк Хабра с неизвестными грейдом И опытом.
+    """Добор описания для старых/резервных строк Хабра с неизвестными полями.
     today_rows - {rownum: {...}} строк, записанных В ЭТОМ прогоне (из main()) -
     если добор попадает в одну из них, обновляет её данные на месте, чтобы
     notify_top ниже пересобрался с учётом добора (см. вызов в main())."""
@@ -1144,9 +1172,13 @@ def enrich_habr_descriptions(ws, today_rows):
             continue
         if row[src_idx] != ENRICH_SOURCE:
             continue
-        if row[ver_idx] == ENRICH_VERSION_LABEL:
+        version = row[ver_idx]
+        if version == ENRICH_VERSION_LABEL:
             continue
-        if row[grade_idx].strip() != 'не указано' or row[exp_idx].strip() != 'не указано':
+        pending_full_description = version == ENRICH_PENDING_LABEL
+        if (not pending_full_description
+                and (row[grade_idx].strip() != 'не указано'
+                     or row[exp_idx].strip() != 'не указано')):
             continue
         d = parse_date(row[pub_idx] if len(row) > pub_idx else '')
         if d is None:
@@ -1235,7 +1267,10 @@ def enrich_habr_descriptions(ws, today_rows):
                   f'Проверь, что селектор тянет описание, а не что-то ещё')
             ok += 1
             if rownum in today_rows:
-                today_rows[rownum]['score'] = 0.0
+                today_rows[rownum].update({
+                    'score': 0.0,
+                    'awaiting_habr_description': False,
+                })
             continue
 
         # P2.3 аудита: если полное описание уверенно понизило score ниже
@@ -1265,7 +1300,10 @@ def enrich_habr_descriptions(ws, today_rows):
                   f'старая оценка заменена, строка исключена из рассылки и повторного добора')
             ok += 1
             if rownum in today_rows:
-                today_rows[rownum]['score'] = new_score_num
+                today_rows[rownum].update({
+                    'score': new_score_num,
+                    'awaiting_habr_description': False,
+                })
             continue
 
         item = {'source_id': row[0], 'src': ENRICH_SOURCE,
@@ -1305,6 +1343,7 @@ def enrich_habr_descriptions(ws, today_rows):
                 'format': str(data.get('format') or ''),
                 'location': str(data.get('location') or ''),
                 'score': score_num,
+                'awaiting_habr_description': False,
             })
 
     reasons_txt = ', '.join(f'{k}: {v}' for k, v in fail_reasons.items()) or '-'
@@ -1410,9 +1449,10 @@ def _audience_source_tag(src):
 def build_audience_candidates(ws, already_sent):
     """Читает лист 'Вакансии' целиком, группирует кандидатов на рассылку по
     блоку опыта (AUDIENCE_BLOCKS): score >= NOTIFY_DETAIL_SCORE, ещё не в
-    журнале, не старше MAX_AGE_DAYS, версия промпта v3/v3+desc (см. решение -
-    старые оценки по другой шкале, сравнивать с новыми нельзя, доживут и
-    уйдут cleanup_old_rows сами). Внутри блока - топ AUDIENCE_BLOCK_TOP по
+    журнале, не старше MAX_AGE_DAYS, версия PROMPT_VERSION либо
+    ENRICH_VERSION_LABEL (старые оценки по другой шкале сравнивать с текущими
+    нельзя — они доживут свой срок и уйдут через cleanup_old_rows). Внутри
+    блока - топ AUDIENCE_BLOCK_TOP по
     score. Отсечка по опыту - здесь, не в промпте: LLM объективно описывает
     вакансию, кому её показать - решение дистрибуции, не оценки.
     Читает ВЕСЬ лист (не только сегодняшнее добавленное) - так подхватывается
@@ -1745,10 +1785,16 @@ def main():
                         # добор ниже может поднять score выше NOTIFY_DETAIL_SCORE
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
     skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
+    deferred_habr_without_desc = 0  # отрицательный ответ по короткой карточке не закрепляем
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
     new_rejections = []         # [(source_id, reason)] - в журнал "Отбраковано" одним махом в конце
     for it in todo:
-        data, fail_reason = llm_evaluate(it['text'])
+        eval_text, has_full_habr_desc, desc_fail_reason = prepare_primary_evaluation_text(it)
+        if desc_fail_reason:
+            print(f'    [Хабр] полное описание недоступно ({desc_fail_reason}): '
+                  f'{it["source_id"]}; оцениваю по карточке, отрицательный '
+                  f'результат не закрепляю')
+        data, fail_reason = llm_evaluate(eval_text)
         if not data:
             # сбой LLM (не «мусор») - НЕ пишем, вернётся на повтор в след. прогон
             llm_errors += 1
@@ -1757,6 +1803,9 @@ def main():
         # не одиночная вакансия (дайджест/инфопост/реклама) - не засоряем лист
         is_vac = str(data.get('is_vacancy', 'true')).strip().lower()
         if is_vac in ('false', 'нет', '0', 'no'):
+            if desc_fail_reason:
+                deferred_habr_without_desc += 1
+                continue
             skipped_non_vacancy += 1
             new_rejections.append((it['source_id'], 'not_vacancy'))
             continue
@@ -1766,11 +1815,23 @@ def main():
         except (TypeError, ValueError):
             score_num = None
         if score_num is not None and score_num < MIN_SCORE:
+            if desc_fail_reason:
+                deferred_habr_without_desc += 1
+                continue
             skipped_low_score += 1
             new_rejections.append((it['source_id'], 'low_score'))
             continue
         num += 1
         row = build_row(it, data)
+        if has_full_habr_desc:
+            # Уже оценено по полной странице: повторный добор в этом и будущих
+            # прогонах не нужен даже тогда, когда сама вакансия не сообщает опыт.
+            row[COLUMNS.index('Версия промпта')] = ENRICH_VERSION_LABEL
+        elif desc_fail_reason:
+            # Положительный результат по карточке сохраняем, чтобы не потерять
+            # вакансию, но до успешного добора не считаем окончательным и не
+            # допускаем к рассылке (_audience_eligible не принимает +card).
+            row[COLUMNS.index('Версия промпта')] = ENRICH_PENDING_LABEL
         # explicit A{n}:O{n} вместо append_row: серверный авто-детект таблицы
         # у append_row пропускает скрытую колонку A (hiddenByUser) и съезжает
         # на B, сдвигая весь row на +1 (source_id мимо A, дедуп по r[0] ломается).
@@ -1800,11 +1861,13 @@ def main():
             'format': str(data.get('format') or ''),
             'location': str(data.get('location') or ''),
             'url': it['url'],
-            'score': score_num,
+            'score': None if desc_fail_reason else score_num,
+            'awaiting_habr_description': bool(desc_fail_reason),
         }
 
     print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
-          f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
+          f'низкий score {skipped_low_score}, отложено без описания Хабра '
+          f'{deferred_habr_without_desc}, ошибки LLM {llm_errors}')
 
     # P1.5 аудита: отличаем "оценили всё, ничего не прошло" (genuine тишина)
     # от "не смогли оценить" (отказ LLM). См. LLM_ERROR_RATE_ALERT выше.
@@ -1830,10 +1893,16 @@ def main():
         (v for v in today_rows.values()
          if v['score'] is not None and v['score'] >= NOTIFY_DETAIL_SCORE),
         key=lambda v: v['score'], reverse=True)
-    if llm_outage and not notify_top:
-        # нечего показать, а причина - вероятный отказ LLM, не genuine тишина.
-        # "Пу-пу-пуу, пока тишина" здесь была бы ложной - не шлём её.
-        print('  [LLM] владельцу не отправляю "тишина" - похоже на отказ LLM, не на отсутствие вакансий')
+    habr_description_pending = (
+        deferred_habr_without_desc > 0
+        or any(v.get('awaiting_habr_description') for v in today_rows.values())
+    )
+    if (llm_outage or habr_description_pending) and not notify_top:
+        # Нечего достоверно показать, но часть оценки не завершена из-за LLM
+        # или недоступной страницы Хабра. "Пу-пу-пуу" здесь была бы ложной.
+        reason = 'отказ LLM' if llm_outage else 'недоступно полное описание Хабра'
+        print(f'  владельцу не отправляю "тишина" - {reason}, '
+              f'не подтверждённое отсутствие вакансий')
     else:
         notify_count(added, notify_top[:10])
     delivered_ids = set()
