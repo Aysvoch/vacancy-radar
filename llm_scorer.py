@@ -480,8 +480,17 @@ def open_raw(gc):
 
 def read_raw(ss):
     """Читает обе вкладки сырья из уже открытой таблицы-сборщика (см. open_raw),
-    возвращает список (source_id, текст_для_LLM, дата, ссылка)."""
+    возвращает список (source_id, текст_для_LLM, дата, ссылка).
+
+    Дедуп по source_id ЗДЕСЬ, а не только по факту записи в "Вакансии" -
+    если один и тот же source_id оказался в сырье дважды (остаток от
+    старого состояния, неоднозначный append - см. P1.2 аудита), без этого
+    дубль ушёл бы в LLM дважды (лишний вызов) и потенциально дал бы ДВЕ
+    записи в todo с одним source_id за один прогон. Первое вхождение
+    остаётся, дальнейшие - молча пропускаются (не ошибка, не мусор -
+    те же данные, второй раз оценивать нечего)."""
     items = []
+    seen = set()
     for name in RAW_SHEETS:
         try:
             ws = ss.worksheet(name)
@@ -491,8 +500,9 @@ def read_raw(ss):
                           what=f"чтение листа «{name}»")   # list of dict по заголовкам
         for row in rows:
             sid = str(row.get('source_id', '')).strip()
-            if not sid:
+            if not sid or sid in seen:
                 continue
+            seen.add(sid)
             if name == 'Хабр':
                 text = (f"{row.get('Должность','')} | {row.get('Компания','')} | "
                         f"{row.get('Локация','')} | грейд {row.get('Грейд','')} | "
@@ -522,9 +532,49 @@ def open_out(gc):
         with_retry(lambda: ws.freeze(rows=1), what="закрепление шапки")
     return ws
 
-def existing_ids(ws):
-    vals = with_retry(lambda: ws.get_all_values(), what="чтение существующих ID")
-    return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
+def existing_state(ws):
+    """(ids, last_row) одним чтением листа "Вакансии":
+    ids - множество УНИКАЛЬНЫХ source_id (для дедупа при построении todo);
+    last_row - номер ПОСЛЕДНЕЙ физически занятой строки по непустому
+    source_id (1, если данных нет - только заголовок).
+
+    last_row - НЕ то же самое, что len(ids). Раньше main() вычислял позицию
+    для новой записи как len(have)+1 (see P1.2 аудита) - это верно только
+    пока в листе нет дублей source_id. Если дубль всё же появился (остаток
+    от старого состояния, гонка параллельных прогонов - см. P1.3 аудита,
+    неоднозначный append до фикса P1.2-idempotency), len(ids) отстаёт от
+    реальной высоты данных, и запись по len(ids)+1 затирает существующую
+    строку МОЛЧА, без ошибки. Позиция всегда должна браться от last_row."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа «Вакансии»")
+    sid_idx = COLUMNS.index('source_id')
+    ids = set()
+    last_row = 1
+    for i, row in enumerate(vals[1:], start=2):
+        if len(row) > sid_idx and row[sid_idx].strip():
+            ids.add(row[sid_idx])
+            last_row = i
+    return ids, last_row
+
+def find_duplicate_source_ids(ws):
+    """ДИАГНОСТИКА, НЕ автоматика - руками смотреть, руками чистить (см.
+    P1.2 аудита: автоматическую чистку делать не просили). Печатает
+    source_id, встречающиеся в листе "Вакансии" больше одного раза, и
+    номера ВСЕХ их физических строк. Ничего не удаляет, не меняет.
+    Запускать отдельно, не часть обычного прогона main()."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа «Вакансии» для поиска дублей")
+    sid_idx = COLUMNS.index('source_id')
+    rows_by_sid = {}
+    for i, row in enumerate(vals[1:], start=2):
+        if len(row) > sid_idx and row[sid_idx].strip():
+            rows_by_sid.setdefault(row[sid_idx], []).append(i)
+    dupes = {sid: rownums for sid, rownums in rows_by_sid.items() if len(rownums) > 1}
+    if not dupes:
+        print('Дублей source_id в листе «Вакансии» не найдено.')
+        return dupes
+    print(f'Найдено {len(dupes)} source_id с дублями в листе «Вакансии»:')
+    for sid, rownums in dupes.items():
+        print(f'  {sid}: строки {rownums}')
+    return dupes
 
 def _append_rows_dedup(ws, rows, existing_ids_fn, value_input_option, what):
     """append_rows под ретраем НЕ идемпотентен: если Google Sheets реально
@@ -1554,7 +1604,7 @@ def main():
     ss_raw = open_raw(gc)
     items = read_raw(ss_raw)
     ws = open_out(gc)
-    have = existing_ids(ws)
+    have, last_row = existing_state(ws)
     ws_rejected = open_rejected_log(ss_raw)
     cleanup_rejected_log(ws_rejected)
     rejected = rejected_ids(ws_rejected)
@@ -1574,7 +1624,10 @@ def main():
           f'уже отбраковано: {len(rejected)}, старше {MAX_AGE_DAYS}д пропущено: '
           f'{skipped_old}, к оценке: {len(todo)}')
 
-    num = len(have)
+    num = last_row - 1   # last_row - номер последней занятой строки, num - счётчик
+                          # "сколько строк данных уже есть" (заголовок не считаем) -
+                          # НЕ len(have): при дублях source_id в листе это разошлось бы
+                          # (см. existing_state), и запись пошла бы не в ту строку
     added = 0
     sheet_rows = ws.row_count   # кэш текущего размера листа для авто-расширения
     today_rows = {}    # rownum -> данные для notify_top; заполняется на КАЖДУЮ
