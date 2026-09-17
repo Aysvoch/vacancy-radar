@@ -406,10 +406,42 @@ def row_tg(v):
             'актуальна', '', '', '']
 
 def append_new(ws, rows):
-    if rows:
-        with_retry(lambda: ws.append_rows(rows, value_input_option='USER_ENTERED'),
-                   what="запись новых строк в сборщик")
-    return len(rows)
+    """append_rows НЕ идемпотентен под ретраем: если Google Sheets реально
+    применил запись, а ответ до клиента не дошёл (таймаут), обычный
+    with_retry вызвал бы fn() заново и задвоил строки в сыром листе - ровно
+    тот случай, что потом read_raw()/todo в llm_scorer.py никак не
+    отфильтруют (дедуп там только против уже ЗАПИСАННЫХ в "Вакансии", не
+    против дублей внутри одного чтения сырья). Поэтому здесь - свой цикл
+    повторов: после неудачи перечитываем existing_ids и убираем из
+    следующей попытки строки, которые уже реально записались."""
+    if not rows:
+        return 0
+    remaining = rows
+    tries, base_delay = 5, 2
+    for attempt in range(1, tries + 1):
+        try:
+            ws.append_rows(remaining, value_input_option='USER_ENTERED')
+            return len(rows)
+        except Exception as e:
+            if attempt == tries:
+                print(f"  [retry] запись новых строк в сборщик: не удалось после {tries} попыток: {e}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"  [retry] запись новых строк в сборщик: попытка {attempt} не удалась ({e}), "
+                  f"проверяю что реально записалось, жду {delay}с...")
+            time.sleep(delay)
+            try:
+                have_now = existing_ids(ws)
+            except Exception:
+                have_now = set()   # не смогли проверить - ретраим как было, без риска потерять строки
+            before = len(remaining)
+            remaining = [row for row in remaining if row[0] not in have_now]
+            if before != len(remaining):
+                print(f"  [retry] {before - len(remaining)} строк(и) уже реально записались - убрано из повтора")
+            if not remaining:
+                print("  [retry] все строки уже записались - дубль предотвращён")
+                return len(rows)
+    return 0
 
 def _parse_pub_date(s):
     """Парсит дату из 'Опубликовано'. '2026-08-12', '2026-08-12 00:00:00', datetime.

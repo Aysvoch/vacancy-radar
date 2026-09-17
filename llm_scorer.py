@@ -526,6 +526,43 @@ def existing_ids(ws):
     vals = with_retry(lambda: ws.get_all_values(), what="чтение существующих ID")
     return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
 
+def _append_rows_dedup(ws, rows, existing_ids_fn, value_input_option, what):
+    """append_rows под ретраем НЕ идемпотентен: если Google Sheets реально
+    применил запись, а ответ до клиента не дошёл (таймаут), обычный
+    with_retry вызвал бы append_rows заново и задвоил строки в журнале.
+    Перед КАЖДЫМ повтором перечитываем existing_ids_fn(ws) и убираем из
+    следующей попытки строки (по 0-й колонке, source_id), которые уже
+    реально записались. Используется для служебных журналов ("Аудитория",
+    "Отбраковано") - не для листа "Вакансии", там своя защита через явный
+    target_range (см. build_row/target_range в main())."""
+    if not rows:
+        return
+    remaining = rows
+    tries, base_delay = 5, 2
+    for attempt in range(1, tries + 1):
+        try:
+            ws.append_rows(remaining, value_input_option=value_input_option)
+            return
+        except Exception as e:
+            if attempt == tries:
+                print(f"  [retry] {what}: не удалось после {tries} попыток: {e}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"  [retry] {what}: попытка {attempt} не удалась ({e}), "
+                  f"проверяю что реально записалось, жду {delay}с...")
+            time.sleep(delay)
+            try:
+                have_now = existing_ids_fn(ws)
+            except Exception:
+                have_now = set()   # не смогли проверить - ретраим как было, без риска потерять строки
+            before = len(remaining)
+            remaining = [row for row in remaining if row[0] not in have_now]
+            if before != len(remaining):
+                print(f"  [retry] {before - len(remaining)} строк(и) уже реально записались - убрано из повтора")
+            if not remaining:
+                print(f"  [retry] {what}: все строки уже записались - дубль предотвращён")
+                return
+
 # ==========================================================================
 # Журнал рассылки аудитории (часть Б) - служебная механика, не то, на что
 # смотрят глазами, поэтому живёт в таблице-сборщике, а не в Таблице неудач.
@@ -556,12 +593,12 @@ def append_sent(ws, source_ids):
     # там из-за этого записываем явным A{n}:O{n}, а не append_row). Если когда-нибудь
     # здесь тоже спрячут колонку - повторится тот же баг. Прячете колонку - переходите
     # на явный target_range, как в build_row, а не append_rows.
+    # Идемпотентность под ретраем - см. _append_rows_dedup.
     if not source_ids:
         return
     now_iso = dt.datetime.now().isoformat(timespec='seconds')
     rows = [[sid, now_iso] for sid in source_ids]
-    with_retry(lambda: ws.append_rows(rows, value_input_option='RAW'),
-              what="запись в журнал «Аудитория»")
+    _append_rows_dedup(ws, rows, already_sent_ids, 'RAW', "запись в журнал «Аудитория»")
 
 def cleanup_audience_log(ws):
     """Чистит лист 'Аудитория' от записей старше AUDIENCE_LOG_MAX_AGE_DAYS (по
@@ -593,6 +630,75 @@ def cleanup_audience_log(ws):
         print(f'  [аудитория] журнал: удалено старых записей (>{AUDIENCE_LOG_MAX_AGE_DAYS}д): {len(to_delete)}')
     except Exception as e:
         print(f'  [аудитория] журнал: не удалось подчистить: {e}')
+
+# ==========================================================================
+# Журнал отбраковок - без него вакансия, которую LLM оценила и отсеяла
+# (is_vacancy=false ИЛИ score<MIN_SCORE), нигде не остаётся отмеченной как
+# "уже оценена" - в лист "Вакансии" такая строка не пишется, have строится
+# только по нему. На каждом следующем прогоне (до истечения возраста сырья,
+# см. MAX_AGE_DAYS/SOURCE_MAX_AGE_DAYS в vacancy_collector.py) та же
+# вакансия снова уходит в LLM с тем же результатом - до ~MAX_AGE_DAYS x
+# 2 прогона/сутки повторных вызовов впустую на одну и ту же вакансию.
+# Живёт в таблице-сборщике (как и "Аудитория"), не в "Вакансии" - листа со
+# схемой/колонками из COLUMNS это никак не касается.
+# ==========================================================================
+REJECTED_LOG_SHEET = 'Отбраковано'
+REJECTED_LOG_COLUMNS = ['source_id', 'reason', 'rejected_at']
+REJECTED_LOG_MAX_AGE_DAYS = MAX_AGE_DAYS + 7   # тот же запас, что у AUDIENCE_LOG_MAX_AGE_DAYS
+
+def open_rejected_log(ss):
+    """Открывает/создаёт лист 'Отбраковано' в таблице-сборщике (ss - уже
+    открытая open_raw())."""
+    try:
+        ws = ss.worksheet(REJECTED_LOG_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=REJECTED_LOG_SHEET, rows=1000, cols=len(REJECTED_LOG_COLUMNS))
+        with_retry(lambda: ws.update([REJECTED_LOG_COLUMNS], 'A1'),
+                  what="запись заголовка «Отбраковано»")
+    return ws
+
+def rejected_ids(ws):
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Отбраковано»")
+    return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
+
+def append_rejected(ws, entries):
+    """entries - список (source_id, reason). Идемпотентность под ретраем -
+    см. _append_rows_dedup."""
+    if not entries:
+        return
+    now_iso = dt.datetime.now().isoformat(timespec='seconds')
+    rows = [[sid, reason, now_iso] for sid, reason in entries]
+    _append_rows_dedup(ws, rows, rejected_ids, 'RAW', "запись в журнал «Отбраковано»")
+
+def cleanup_rejected_log(ws):
+    """Чистит лист 'Отбраковано' от записей старше REJECTED_LOG_MAX_AGE_DAYS
+    (по rejected_at). По образцу cleanup_audience_log. Нераспознанная дата ->
+    НЕ удаляем (лучше лишняя строка, чем потерянный дедуп)."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Отбраковано» перед подчисткой")
+    if len(vals) <= 1:
+        return
+    cutoff = dt.date.today() - dt.timedelta(days=REJECTED_LOG_MAX_AGE_DAYS)
+    to_delete = []
+    for i, row in enumerate(vals[1:], start=2):
+        raw = row[2] if len(row) > 2 else ''
+        try:
+            rejected_date = dt.datetime.fromisoformat(raw).date()
+        except ValueError:
+            continue
+        if rejected_date < cutoff:
+            to_delete.append(i)
+    if not to_delete:
+        return
+    sid = ws.id
+    reqs = [{'deleteDimension': {
+        'range': {'sheetId': sid, 'dimension': 'ROWS',
+                  'startIndex': rownum - 1, 'endIndex': rownum}}}
+            for rownum in sorted(to_delete, reverse=True)]
+    try:
+        ws.spreadsheet.batch_update({'requests': reqs})
+        print(f'  [отбраковка] журнал: удалено старых записей (>{REJECTED_LOG_MAX_AGE_DAYS}д): {len(to_delete)}')
+    except Exception as e:
+        print(f'  [отбраковка] журнал: не удалось подчистить: {e}')
 
 def build_row(item, data):
     def g(key, default='не указано'):
@@ -789,7 +895,12 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
     (у неё свой лимит AUDIENCE_BLOCK_TOP на блок опыта за прогон). Если защищённых строк
     больше, чем нужно удалить, чтобы дойти до MAX_ROWS, - cap в этот прогон
     не дотянется до предела, и это осознанно: лучше временно больше строк,
-    чем потерянная доставка."""
+    чем потерянная доставка.
+
+    Защита учитывает _audience_eligible (версия промпта + блок опыта) -
+    строка со старой версией промпта или опытом '6+ лет'/непонятным
+    физически не может попасть в build_audience_candidates, поэтому
+    "защита от cap'а ради будущей доставки" для неё бессмысленна."""
     vals = with_retry(lambda: ws.get_all_values(), what="чтение листа перед подчисткой")
     if len(vals) <= 1:
         return
@@ -821,6 +932,8 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
     if n_data > MAX_ROWS:
         seen_idx = COLUMNS.index('Просмотрено')
         score_idx = COLUMNS.index('Оценка')
+        version_idx = COLUMNS.index('Версия промпта')
+        exp_idx = COLUMNS.index('Опыт (треб.)')
 
         def parse_score(row):
             try:
@@ -832,7 +945,11 @@ def cleanup_old_rows(ws, delivered_ids=frozenset()):
         for i, row in data_rows:
             sid_val = row[sid_idx]
             score = parse_score(row)
-            protected = score is not None and score >= NOTIFY_DETAIL_SCORE and sid_val not in delivered_ids
+            version = row[version_idx] if len(row) > version_idx else ''
+            exp = row[exp_idx] if len(row) > exp_idx else ''
+            protected = (score is not None and score >= NOTIFY_DETAIL_SCORE
+                         and sid_val not in delivered_ids
+                         and _audience_eligible(version, exp))
             if not protected:
                 seen = row[seen_idx] if len(row) > seen_idx else ''
                 deletable.append((i, seen == 'TRUE', score if score is not None else -1))
@@ -1107,6 +1224,18 @@ AUDIENCE_BLOCKS = [
     ('3-6 лет', True, '3-6 лет'),
     ('не указано', False, 'Опыт не указан'),
 ]
+AUDIENCE_BLOCK_KEYS = {key for key, _, _ in AUDIENCE_BLOCKS}
+
+def _audience_eligible(version, exp):
+    """Может ли строка в принципе дойти до рассылки - та же пара условий,
+    что использует build_audience_candidates (версия промпта + опыт входит
+    в один из 4 блоков). Общая функция, чтобы cleanup_old_rows (защита от
+    cap'а MAX_ROWS) не расходилась с реальным критерием отбора - раньше
+    cleanup_old_rows защищала от cap'а любую строку с высокой оценкой, даже
+    если её версия промпта устарела или опыт '6+ лет'/непонятный - такая
+    строка физически не может попасть в рассылку, но занимала защищённое
+    место в листе бессрочно."""
+    return version in (PROMPT_VERSION, ENRICH_VERSION_LABEL) and exp in AUDIENCE_BLOCK_KEYS
 
 # Словесная форма формата для второй строки позиции в дайджесте. 'Офис' и
 # 'не указано' сознательно не показываем - офис как формат по умолчанию не
@@ -1139,11 +1268,9 @@ def build_audience_candidates(ws, already_sent):
         if too_old(row.get('Опубликовано', '')):
             continue
         version = str(row.get('Версия промпта', '')).strip()
-        if version not in (PROMPT_VERSION, ENRICH_VERSION_LABEL):
-            continue
         exp = str(row.get('Опыт (треб.)', '')).strip()
-        if exp not in by_block:
-            continue   # '6+ лет' и всё прочее - в рассылку не идёт вообще
+        if not _audience_eligible(version, exp):
+            continue   # старая версия промпта ИЛИ '6+ лет'/непонятный опыт - не идёт в рассылку
         try:
             score = float(row.get('Оценка'))
         except (TypeError, ValueError):
@@ -1169,10 +1296,16 @@ def build_audience_candidates(ws, already_sent):
 def _audience_item_lines(n, v):
     """Две строки одной позиции дайджеста:
     'N. Название - Компания [Источник]' (название - ссылка) и
-    '   вилка · локация, формат' (обе части опускаются, если неинформативны)."""
+    '   вилка · локация, формат' (обе части опускаются, если неинформативны).
+    Название и компания обрезаются - без этого аномально длинное значение
+    (кривой ответ LLM, инъекция через текст вакансии) могло раздуть ОДНУ
+    строку далеко за AUDIENCE_MSG_BUDGET - build_audience_messages не режет
+    внутри одной карточки, только между карточками."""
     title = v['title'] if len(v['title']) <= 60 else v['title'][:60].rstrip() + '…'
     link = f'<a href="{html.escape(v["url"], quote=True)}">{html.escape(title)}</a>'
     company = v['company'] if v['company'] and v['company'] != 'не указано' else ''
+    if len(company) > 40:
+        company = company[:40].rstrip() + '…'
     src_tag = _audience_source_tag(v['src'])
     head = f'{n}. {link}' + (f' - {html.escape(company)}' if company else '') + f' {src_tag}'
 
@@ -1192,36 +1325,44 @@ def _audience_item_lines(n, v):
 
 def build_audience_messages(by_block):
     """Кандидаты по блокам (build_audience_candidates) -> список текстов
-    сообщений, каждый <= AUDIENCE_MSG_BUDGET символов. Одно сообщение вместо
+    сообщений, каждый <= AUDIENCE_MSG_BUDGET символов (кроме редкого случая
+    одной аномально длинной карточки - см. ниже). Одно сообщение вместо
     потока: шапка - заголовок, счётчик по 3 основным блокам СТОЛБЦОМ (каждая
     категория на своей строке, "Категория — N"), разделитель, затем секции
     непустых блоков (включая "Опыт не указан", если непуст) - пустые блоки в
     теле не показываем, нумерация внутри каждого блока заново с 1. Пустая
     строка после разделителя - ровно одна, перед первым непустым блоком.
-    Разбиение по границам строк - механизм от прежней построчной рассылки;
-    при максимум 4×3=12 позициях почти никогда не сработает, остаётся
-    защитным запасом на аномально длинные тексты."""
-    lines = ['🎯 Product manager']
+
+    Разбиение идёт по НЕДЕЛИМЫМ единицам (шапка целиком; заголовок блока
+    вместе с пустой строкой перед ним; каждая карточка вакансии - её 2
+    строки), а не по отдельным строкам - иначе разрыв мог прийтись между
+    названием вакансии и её зарплатой/локацией (та же карточка, разные
+    строки). При максимум 4×3=12 карточках почти никогда не понадобится
+    больше одного сообщения. Одна карточка сама по себе не может раздуть
+    сообщение неограниченно - title/company обрезаны в _audience_item_lines."""
+    header_unit = ['🎯 Product manager']
     for key, show, _ in AUDIENCE_BLOCKS:
         if show:
-            lines.append(f'{key} — {len(by_block[key])}')
-    lines.append('——————————')
+            header_unit.append(f'{key} — {len(by_block[key])}')
+    header_unit.append('——————————')
+
+    units = [header_unit]
     for key, show, header in AUDIENCE_BLOCKS:
         items = by_block[key]
         if not items:
             continue
-        lines.append('')
-        lines.append(header)
+        units.append(['', header])
         for i, v in enumerate(items, start=1):
-            lines.extend(_audience_item_lines(i, v))
+            units.append(_audience_item_lines(i, v))
 
     messages, current, current_len = [], [], 0
-    for line in lines:
-        piece_len = len(line) + (1 if current else 0)   # +1 за '\n', если не первая в чанке
+    for unit in units:
+        unit_text = '\n'.join(unit)
+        piece_len = len(unit_text) + (1 if current else 0)   # +1 за '\n' между единицами
         if current and current_len + piece_len > AUDIENCE_MSG_BUDGET:
             messages.append('\n'.join(current))
-            current, current_len, piece_len = [], 0, len(line)
-        current.append(line)
+            current, current_len, piece_len = [], 0, len(unit_text)
+        current.append(unit_text)
         current_len += piece_len
     if current:
         messages.append('\n'.join(current))
@@ -1345,32 +1486,50 @@ def notify_audience(gc, ss_raw, ws_vacancies):
         return sent_ids
 
     messages = build_audience_messages(by_block)
-    blocked, sent_count = [], 0
+    # Три исхода на подписчика: 'ok' (получил всё), 'blocked' (403/chat not
+    # found - подписчик мёртв НАВСЕГДА, ждать бессмысленно, это отдельная
+    # категория, чистится через report_blocked_subscribers ниже), 'failed'
+    # (временный сбой сети/Telegram - именно из-за него раньше терялась
+    # доставка отдельным подписчикам: пачка помечалась отправленной, как
+    # только хотя бы ОДИН получал её целиком, и подписчик с временным сбоем
+    # эту пачку больше никогда не видел - см. AUDIT_REVIEW.md п.2). Теперь
+    # помечаем пачку отправленной, только если ни у кого не было именно
+    # 'failed' - блокированные в этот подсчёт не входят, иначе один
+    # зависший в KV заблокировавший подписчик держал бы всю рассылку
+    # неподтверждённой бесконечно.
+    blocked, sent_count, transient_failures = [], 0, 0
     for chat_id in subscribers:
-        ok = True
+        outcome = 'ok'
         for text in messages:
             status = send_audience_message(chat_id, text)
             if status == 'blocked':
+                outcome = 'blocked'
                 blocked.append(chat_id)
-                ok = False
                 break
             if status == 'failed':
-                ok = False
+                outcome = 'failed'
                 break
             time.sleep(AUDIENCE_SEND_PAUSE)
-        if ok:
+        if outcome == 'ok':
             sent_count += 1
+        elif outcome == 'failed':
+            transient_failures += 1
 
-    print(f'  [аудитория] разослано {sent_count}/{len(subscribers)} подписчикам, '
+    print(f'  [аудитория] разослано {sent_count}/{len(subscribers)} подписчикам '
+          f'({transient_failures} временных сбоев, {len(blocked)} заблокировали бота), '
           f'вакансий в пачке: {len(all_candidates)}')
 
-    # Пометить как отправленное можно, только если пачка реально до кого-то дошла,
-    # либо подписчиков просто не было (рассылать некому - пачка тоже "выполнена").
-    # Если подписчики БЫЛИ, а дошло до 0 - похоже на системный сбой (не тот
-    # BOT_TOKEN и т.п.): лучше повторить всю пачку следующим прогоном, чем
-    # тихо списать вакансию в архив, до которой реально никто не дошёл.
-    if subscribers and sent_count == 0:
-        print('  [аудитория] ни один получатель не подтверждён - не помечаю как отправленное, повтор в следующий прогон')
+    # Пометить как отправленное можно, только если НИ У ОДНОГО подписчика не
+    # было временного сбоя (иначе повторяем всю пачку следующим прогоном -
+    # кто-то получит ленту дважды, это терпимо, а вакансия, потерянная
+    # навсегда для отдельного подписчика, - нет), И при этом реально кто-то
+    # получил (sent_count>0) либо все до единого оказались заблокированы
+    # (тогда transient_failures==0 само по себе, попытки повторять нечего).
+    # sent_count==0 без единого заблокированного - похоже на системный сбой
+    # (не тот BOT_TOKEN и т.п.): лучше повторить всю пачку следующим
+    # прогоном, чем тихо списать вакансию в архив, до которой никто не дошёл.
+    if subscribers and (transient_failures > 0 or (sent_count == 0 and not blocked)):
+        print('  [аудитория] не все получатели подтверждены - не помечаю как отправленное, повтор в следующий прогон')
     else:
         append_sent(ws_log, [c['source_id'] for c in all_candidates])
         sent_ids = sent_ids | {c['source_id'] for c in all_candidates}
@@ -1396,14 +1555,24 @@ def main():
     items = read_raw(ss_raw)
     ws = open_out(gc)
     have = existing_ids(ws)
+    ws_rejected = open_rejected_log(ss_raw)
+    cleanup_rejected_log(ws_rejected)
+    rejected = rejected_ids(ws_rejected)
+    # rejected - source_id, УЖЕ оценённые и отсеянные (is_vacancy=false ИЛИ
+    # score<MIN_SCORE) на прошлых прогонах. Без этого фильтра такая вакансия
+    # никогда не попадает в have (в лист "Вакансии" не пишется) и заново
+    # уходит в LLM на каждом прогоне до истечения возраста сырья - впустую,
+    # результат один и тот же (see журнал "Отбраковано" выше).
+    skip_ids = have | rejected
     todo = [it for it in items
-            if it['source_id'] not in have and not too_old(it['published'])]
+            if it['source_id'] not in skip_ids and not too_old(it['published'])]
     skipped_old = sum(1 for it in items
-                      if it['source_id'] not in have and too_old(it['published']))
+                      if it['source_id'] not in skip_ids and too_old(it['published']))
     if MAX_PER_RUN:
         todo = todo[:MAX_PER_RUN]
     print(f'  всего в сырье: {len(items)}, уже оценено: {len(have)}, '
-          f'старше {MAX_AGE_DAYS}д пропущено: {skipped_old}, к оценке: {len(todo)}')
+          f'уже отбраковано: {len(rejected)}, старше {MAX_AGE_DAYS}д пропущено: '
+          f'{skipped_old}, к оценке: {len(todo)}')
 
     num = len(have)
     added = 0
@@ -1414,6 +1583,7 @@ def main():
     skipped_non_vacancy = 0     # LLM ответил, но это подборка/инфопост/реклама
     skipped_low_score = 0       # реальная вакансия, но score < MIN_SCORE - не мой профиль
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
+    new_rejections = []         # [(source_id, reason)] - в журнал "Отбраковано" одним махом в конце
     for it in todo:
         data, fail_reason = llm_evaluate(it['text'])
         if not data:
@@ -1425,6 +1595,7 @@ def main():
         is_vac = str(data.get('is_vacancy', 'true')).strip().lower()
         if is_vac in ('false', 'нет', '0', 'no'):
             skipped_non_vacancy += 1
+            new_rejections.append((it['source_id'], 'not_vacancy'))
             continue
         # низкая оценка (< MIN_SCORE) - не засоряем лист. Нераспознанный score -> не отсекаем.
         try:
@@ -1433,6 +1604,7 @@ def main():
             score_num = None
         if score_num is not None and score_num < MIN_SCORE:
             skipped_low_score += 1
+            new_rejections.append((it['source_id'], 'low_score'))
             continue
         num += 1
         row = build_row(it, data)
@@ -1470,6 +1642,11 @@ def main():
 
     print(f'  итог по прогону: записано {added}, не вакансия {skipped_non_vacancy}, '
           f'низкий score {skipped_low_score}, ошибки LLM {llm_errors}')
+
+    try:
+        append_rejected(ws_rejected, new_rejections)
+    except Exception as e:
+        print(f'  [отбраковка] не удалось записать журнал: {e}')
 
     try:
         enrich_habr_descriptions(ws, today_rows)
