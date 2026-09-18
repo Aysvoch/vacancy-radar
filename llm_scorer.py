@@ -705,39 +705,134 @@ def cleanup_audience_log(ws):
 # Журнал отбраковок - без него вакансия, которую LLM оценила и отсеяла
 # (is_vacancy=false ИЛИ score<MIN_SCORE), нигде не остаётся отмеченной как
 # "уже оценена" - в лист "Вакансии" такая строка не пишется, have строится
-# только по нему. На каждом следующем прогоне (до истечения возраста сырья,
-# см. MAX_AGE_DAYS/SOURCE_MAX_AGE_DAYS в vacancy_collector.py) та же
-# вакансия снова уходит в LLM с тем же результатом - до ~MAX_AGE_DAYS x
-# 2 прогона/сутки повторных вызовов впустую на одну и ту же вакансию.
+# только по нему. Без этого журнала та же вакансия снова уходит в LLM с тем
+# же результатом на каждом прогоне (до истечения возраста сырья, см.
+# MAX_AGE_DAYS/SOURCE_MAX_AGE_DAYS в vacancy_collector.py) - до ~MAX_AGE_DAYS
+# x 2 прогона/сутки повторных вызовов впустую на одну и ту же вакансию.
+#
+# ИСКЛЮЧЕНИЕ (P2.2 аудита): отбраковки reason='low_score' под устаревшей
+# REJECTION_POLICY_VERSION - не окончательны, main() возвращает часть из них
+# на переоценку каждый прогон (см. REJECTION_RECONSIDER_MAX_PER_RUN,
+# load_rejected_log). reason='not_vacancy' остаётся окончательным всегда,
+# от версии политики не зависит - это ответ на вопрос "вакансия или
+# инфопост/реклама", не про шкалу оценки.
+#
 # Живёт в таблице-сборщике (как и "Аудитория"), не в "Вакансии" - листа со
 # схемой/колонками из COLUMNS это никак не касается.
 # ==========================================================================
 REJECTED_LOG_SHEET = 'Отбраковано'
-REJECTED_LOG_COLUMNS = ['source_id', 'reason', 'rejected_at']
+# policy_version - ЧЕТВЁРТАЯ колонка, ПОСЛЕ rejected_at (P2.2 аудита) -
+# cleanup_rejected_log читает дату жёстко по row[2], порядок первых трёх
+# колонок трогать нельзя. У строк, записанных ДО этой правки, колонки нет
+# (read_all_values вернёт короткую строку) - защитное row[3] if len(row)>3
+# else '' ниже везде трактует это как "версии нет", то есть "устарела".
+REJECTED_LOG_COLUMNS = ['source_id', 'reason', 'rejected_at', 'policy_version']
 REJECTED_LOG_MAX_AGE_DAYS = MAX_AGE_DAYS + 7   # тот же запас, что у AUDIENCE_LOG_MAX_AGE_DAYS
+
+# ==========================================================================
+# ВЕРСИЯ ПОЛИТИКИ ОТБРАКОВКИ - отдельно от PROMPT_VERSION (P2.2 аудита).
+# Повышай ТОЛЬКО когда меняется смысл самой отбраковки: шкала оценки, порог
+# MIN_SCORE, определение целевой роли, правила is_vacancy - то, из-за чего
+# старая отбраковка reason='low_score' могла бы получить другой результат
+# сегодня. Обычная правка формулировок SYSTEM_PROMPT (см. PROMPT_VERSION),
+# не меняющая эти правила по существу, эту версию НЕ двигает.
+# ==========================================================================
+REJECTION_POLICY_VERSION = 'p1'
+
+# Потолок на переоценку записей 'low_score' с устаревшей policy_version за
+# прогон (см. main()) - той же природы, что ENRICH_MAX_PER_RUN: отбор в
+# первую очередь самых старых по rejected_at (честная очередь), чтобы
+# запись, которая проваливается систематически, не заняла место остальных
+# кандидатов навсегда (её rejected_at при повторном провале обновляется на
+# "сейчас" - см. main() - и она сама сползает в конец очереди без отдельного
+# счётчика попыток, тот же приём, что в enrich_habr_descriptions).
+REJECTION_RECONSIDER_MAX_PER_RUN = 20
 
 def open_rejected_log(ss):
     """Открывает/создаёт лист 'Отбраковано' в таблице-сборщике (ss - уже
-    открытая open_raw())."""
+    открытая open_raw()). Мигрирует заголовок при переходе на 4 колонки
+    (policy_version, P2.2 аудита) - существующие СТРОКИ ДАННЫХ не трогает:
+    у них "нет версии" и так означает "устарела" (см. REJECTION_POLICY_VERSION
+    и load_rejected_log)."""
     try:
         ws = ss.worksheet(REJECTED_LOG_SHEET)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=REJECTED_LOG_SHEET, rows=1000, cols=len(REJECTED_LOG_COLUMNS))
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение листа «Отбраковано»")
+    if not vals or vals[0][:len(REJECTED_LOG_COLUMNS)] != REJECTED_LOG_COLUMNS:
         with_retry(lambda: ws.update([REJECTED_LOG_COLUMNS], 'A1'),
-                  what="запись заголовка «Отбраковано»")
+                  what="запись/миграция заголовка «Отбраковано»")
     return ws
 
 def rejected_ids(ws):
+    """Только для дедупа в _append_rows_dedup (проверка "уже реально
+    записалось") - НЕ для решения, кого исключать из todo, см.
+    load_rejected_log ниже."""
     vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Отбраковано»")
     return {r[0] for r in vals[1:] if r and r[0]} if len(vals) > 1 else set()
 
+def load_rejected_log(ws):
+    """{source_id: {'row': номер физической строки, 'reason', 'rejected_at',
+    'policy_version'}} - для решения в main(), кого исключать из todo
+    навсегда, а кого вернуть на переоценку, и для обновления/удаления
+    конкретной строки журнала на месте (P2.2 аудита)."""
+    vals = with_retry(lambda: ws.get_all_values(), what="чтение журнала «Отбраковано» для отбора")
+    result = {}
+    for i, row in enumerate(vals[1:], start=2):
+        if not row or not row[0]:
+            continue
+        result[row[0]] = {
+            'row': i,
+            'reason': row[1] if len(row) > 1 else '',
+            'rejected_at': row[2] if len(row) > 2 else '',
+            'policy_version': row[3] if len(row) > 3 else '',
+        }
+    return result
+
+def update_rejected_entry(ws, rownum, reason, rejected_at):
+    """Обновляет существующую строку журнала НА МЕСТЕ (reason/rejected_at/
+    policy_version=REJECTION_POLICY_VERSION) - используется, когда запись,
+    возвращённая на переоценку, снова не прошла (P2.2 аудита). Не append:
+    append_rejected идёт через _append_rows_dedup с дедупом по source_id -
+    новая строка была бы молча отброшена, версия не обновилась бы, и запись
+    вернулась бы в очередь на переоценку на следующем же прогоне бесконечно."""
+    with_retry(lambda: ws.batch_update([
+        {'range': f'B{rownum}:D{rownum}', 'values': [[reason, rejected_at, REJECTION_POLICY_VERSION]]},
+    ], value_input_option='RAW'), what="обновление записи журнала «Отбраковано» после переоценки")
+
+def delete_rejected_rows(ws, rownums):
+    """Удаляет строки журнала (переоценённые записи, прошедшие порог и
+    записанные в «Вакансии» - им в «Отбраковано» больше не место).
+
+    БЕЗ with_retry - по образцу cleanup_rejected_log: позиционное удаление
+    строк не идемпотентно под ретраем (если сервер реально удалил, а ответ
+    до клиента не дошёл, повтор с ТЕМИ ЖЕ номерами строк после сдвига грида
+    удалит уже другие, случайные строки). Одна попытка; при неудаче строка
+    просто останется в журнале - следующий прогон, если source_id снова
+    пройдёт порог, попробует удалить её заново с уже актуальным номером
+    строки."""
+    if not rownums:
+        return
+    sid = ws.id
+    reqs = [{'deleteDimension': {
+        'range': {'sheetId': sid, 'dimension': 'ROWS',
+                  'startIndex': rownum - 1, 'endIndex': rownum}}}
+            for rownum in sorted(set(rownums), reverse=True)]
+    try:
+        ws.spreadsheet.batch_update({'requests': reqs})
+    except Exception as e:
+        print(f'  [отбраковка] не удалось удалить переоценённые записи: {e}')
+
 def append_rejected(ws, entries):
-    """entries - список (source_id, reason). Идемпотентность под ретраем -
-    см. _append_rows_dedup."""
+    """entries - список (source_id, reason) ДЕЙСТВИТЕЛЬНО НОВЫХ отбраковок
+    (не бывших раньше в журнале - для повторной отбраковки уже возвращённой
+    на переоценку записи см. update_rejected_entry, не append: дедуп по
+    source_id в _append_rows_dedup иначе молча отбросит новую строку и
+    версия не обновится). Идемпотентность под ретраем - см. _append_rows_dedup."""
     if not entries:
         return
     now_iso = dt.datetime.now().isoformat(timespec='seconds')
-    rows = [[sid, reason, now_iso] for sid, reason in entries]
+    rows = [[sid, reason, now_iso, REJECTION_POLICY_VERSION] for sid, reason in entries]
     _append_rows_dedup(ws, rows, rejected_ids, 'RAW', "запись в журнал «Отбраковано»")
 
 def cleanup_rejected_log(ws):
@@ -1794,12 +1889,32 @@ def main():
     have, last_row = existing_state(ws)
     ws_rejected = open_rejected_log(ss_raw)
     cleanup_rejected_log(ws_rejected)
-    rejected = rejected_ids(ws_rejected)
-    # rejected - source_id, УЖЕ оценённые и отсеянные (is_vacancy=false ИЛИ
-    # score<MIN_SCORE) на прошлых прогонах. Без этого фильтра такая вакансия
-    # никогда не попадает в have (в лист "Вакансии" не пишется) и заново
-    # уходит в LLM на каждом прогоне до истечения возраста сырья - впустую,
-    # результат один и тот же (see журнал "Отбраковано" выше).
+    rejected_log = load_rejected_log(ws_rejected)
+    # P2.2 аудита: 'not_vacancy' - окончательно, от версии политики не зависит
+    # (это ответ на вопрос "вакансия или инфопост/реклама", а не про шкалу
+    # оценки). 'low_score' под ТЕКУЩЕЙ REJECTION_POLICY_VERSION - тоже
+    # окончательно (её уже переоценили при этой самой политике). 'low_score'
+    # под УСТАРЕВШЕЙ (в т.ч. отсутствующей у старых строк) версией - кандидат
+    # на переоценку, но не более REJECTION_RECONSIDER_MAX_PER_RUN за прогон,
+    # самые старые по rejected_at первыми (честная очередь, см. константу
+    # выше) - остальные до следующего прогона остаются в skip_ids как есть.
+    reconsider_pool = sorted(
+        (sid for sid, meta in rejected_log.items()
+         if meta['reason'] == 'low_score' and meta['policy_version'] != REJECTION_POLICY_VERSION),
+        key=lambda sid: rejected_log[sid]['rejected_at'])
+    reconsider_ids = set(reconsider_pool[:REJECTION_RECONSIDER_MAX_PER_RUN])
+    deferred_reconsider_ids = set(reconsider_pool[REJECTION_RECONSIDER_MAX_PER_RUN:])
+    permanently_rejected = {
+        sid for sid, meta in rejected_log.items()
+        if meta['reason'] == 'not_vacancy' or meta['policy_version'] == REJECTION_POLICY_VERSION}
+    # rejected - source_id, которые НЕ уйдут в LLM на этом прогоне: уже
+    # оценённые и отсеянные окончательно, плюс отбраковки на переоценку,
+    # которым в этот раз не хватило места в REJECTION_RECONSIDER_MAX_PER_RUN.
+    # Без permanently_rejected такая вакансия никогда не попадает в have (в
+    # лист "Вакансии" не пишется) и заново уходит в LLM на каждом прогоне до
+    # истечения возраста сырья - впустую, результат один и тот же (см.
+    # журнал "Отбраковано" выше).
+    rejected = permanently_rejected | deferred_reconsider_ids
     skip_ids = have | rejected
     todo = [it for it in items
             if it['source_id'] not in skip_ids and not too_old(it['published'])]
@@ -1808,8 +1923,8 @@ def main():
     if MAX_PER_RUN:
         todo = todo[:MAX_PER_RUN]
     print(f'  всего в сырье: {len(items)}, уже оценено: {len(have)}, '
-          f'уже отбраковано: {len(rejected)}, старше {MAX_AGE_DAYS}д пропущено: '
-          f'{skipped_old}, к оценке: {len(todo)}')
+          f'уже отбраковано: {len(rejected)} (из них на переоценке: {len(reconsider_ids)}), '
+          f'старше {MAX_AGE_DAYS}д пропущено: {skipped_old}, к оценке: {len(todo)}')
 
     num = last_row - 1   # last_row - номер последней занятой строки, num - счётчик
                           # "сколько строк данных уже есть" (заголовок не считаем) -
@@ -1825,6 +1940,7 @@ def main():
     deferred_habr_without_desc = 0  # отрицательный ответ по короткой карточке не закрепляем
     llm_errors = 0              # не ответил/битый JSON после всех попыток - это НЕ мусор
     new_rejections = []         # [(source_id, reason)] - в журнал "Отбраковано" одним махом в конце
+    resolved_reconsidered_ids = []  # id из reconsider_ids, прошедшие порог в этот раз - удалить из журнала
     for it in todo:
         eval_text, has_full_habr_desc, desc_fail_reason = prepare_primary_evaluation_text(it)
         if desc_fail_reason:
@@ -1859,6 +1975,11 @@ def main():
             new_rejections.append((it['source_id'], 'low_score'))
             continue
         num += 1
+        if it['source_id'] in reconsider_ids:
+            # P2.2 аудита: переоценка прошла порог - запись в "Отбраковано"
+            # по этому source_id больше не актуальна, удалить (см. вызов
+            # delete_rejected_rows после цикла).
+            resolved_reconsidered_ids.append(it['source_id'])
         row = build_row(it, data)
         if has_full_habr_desc:
             # Уже оценено по полной странице: повторный добор в этом и будущих
@@ -1916,10 +2037,30 @@ def main():
         print(f'  [LLM] похоже на отказ LLM, не на тишину: {llm_errors}/{len(todo)} '
               f'вакансий не удалось оценить за этот прогон')
 
+    # P2.2 аудита: new_rejections смешивает ДЕЙСТВИТЕЛЬНО новые отбраковки и
+    # повторные отбраковки записей, возвращённых на переоценку (reconsider_ids)
+    # - их нельзя append'ить (append_rejected дедуплицирует по source_id,
+    # новая строка была бы молча отброшена, версия политики не обновилась
+    # бы, и запись вернулась бы на переоценку на следующем же прогоне
+    # бесконечно) - для них обновляем существующую строку журнала на месте.
+    genuinely_new_rejections = []
+    for sid, reason in new_rejections:
+        if sid in reconsider_ids:
+            try:
+                update_rejected_entry(ws_rejected, rejected_log[sid]['row'], reason,
+                                      dt.datetime.now().isoformat(timespec='seconds'))
+            except Exception as e:
+                print(f'  [отбраковка] не удалось обновить запись {sid} после переоценки: {e}')
+        else:
+            genuinely_new_rejections.append((sid, reason))
     try:
-        append_rejected(ws_rejected, new_rejections)
+        append_rejected(ws_rejected, genuinely_new_rejections)
     except Exception as e:
         print(f'  [отбраковка] не удалось записать журнал: {e}')
+
+    if resolved_reconsidered_ids:
+        delete_rejected_rows(
+            ws_rejected, [rejected_log[sid]['row'] for sid in resolved_reconsidered_ids])
 
     try:
         enrich_habr_descriptions(ws, today_rows)
