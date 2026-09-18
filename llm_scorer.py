@@ -33,6 +33,8 @@ import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
+from alerts import send_owner_alert
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -782,8 +784,13 @@ def _sheet_safe(value):
     интерфейсе Sheets. При чтении обратно (get_all_values/get_all_records,
     ValueRenderOption.formatted по умолчанию в gspread) апостроф в
     результате не появляется - это сигнал только на ввод, не часть
-    содержимого ячейки, поэтому дописывать его заново при перезаписи
-    (добор) не нужно."""
+    содержимого ячейки. Именно ПОЭТОМУ его нужно накладывать ЗАНОВО перед
+    КАЖДОЙ записью через USER_ENTERED, включая перезапись при доборе:
+    прочитанное без апострофа значение при повторной записи парсится с
+    нуля, как будто апострофа никогда не было (P1.8 аудита - до правки
+    карантинные блоки enrich_habr_descriptions читали эту фразу буквально
+    наоборот и переносили Компанию/Должность/Локацию/ЗП вилку обратно в
+    Sheets без повторного _sheet_safe)."""
     s = str(value)
     return "'" + s if s.startswith(_FORMULA_TRIGGER_CHARS) else s
 
@@ -1194,7 +1201,10 @@ def enrich_habr_descriptions(ws, today_rows):
         return
     print(f'  [добор] кандидатов: {len(candidates)}')
 
-    last_col = col_to_letter(len(COLUMNS) - 1)
+    last_col = col_to_letter(len(COLUMNS) - 1)      # для полной перезаписи строки (успешный добор)
+    score_col = col_to_letter(score_idx)             # для точечного карантина (только Оценка+Вердикт+Версия)
+    verdict_col = col_to_letter(verdict_idx)
+    ver_col = col_to_letter(ver_idx)
     ok = 0
     fail = 0
     fail_reasons = {}          # 4 категории для итоговой строки
@@ -1250,16 +1260,19 @@ def enrich_habr_descriptions(ws, today_rows):
             # временный сбой, а содержательный результат, повторять его на
             # следующих прогонах незачем.
             is_vacancy_false_count += 1
-            quarantine_row = list(row)
-            while len(quarantine_row) < len(COLUMNS):
-                quarantine_row.append('')
-            quarantine_row[score_idx] = '0'
-            quarantine_row[verdict_idx] = _sheet_safe(
+            # P1.8 аудита: пишем ТОЛЬКО реально меняющиеся ячейки (Оценка+Вердикт
+            # подряд, Версия промпта отдельно - между ними Опубликовано/Ссылка/
+            # Комментарий/Просмотрено, которых карантин не касается), а не всю
+            # строку. Раньше quarantine_row=list(row) копировал Компанию/Должность/
+            # Локацию/ЗП вилку из get_all_values (без апострофов _sheet_safe) и
+            # отправлял их обратно под USER_ENTERED на повторную интерпретацию -
+            # воспроизводило P1.8 для строк, прошедших карантин добора.
+            verdict_text = _sheet_safe(
                 'Карантин добора: полное описание оказалось не единичной вакансией (is_vacancy=false)')
-            quarantine_row[ver_idx] = ENRICH_VERSION_LABEL
-            target_range = f'A{rownum}:{last_col}{rownum}'
-            with_retry(lambda row=quarantine_row, rng=target_range: ws.update(
-                [row], rng, value_input_option='USER_ENTERED'),
+            with_retry(lambda rn=rownum, vt=verdict_text: ws.batch_update([
+                {'range': f'{score_col}{rn}:{verdict_col}{rn}', 'values': [['0', vt]]},
+                {'range': f'{ver_col}{rn}', 'values': [[ENRICH_VERSION_LABEL]]},
+            ], value_input_option='USER_ENTERED'),
                       what="карантин строки после добора (is_vacancy=false)")
             print(f'    [добор][внимание] {url}: LLM сочла страницу НЕ единичной '
                   f'вакансией (is_vacancy=false) - карантин: оценка обнулена, '
@@ -1284,17 +1297,15 @@ def enrich_habr_descriptions(ws, today_rows):
         except (TypeError, ValueError):
             new_score_num = None
         if new_score_num is not None and new_score_num < MIN_SCORE:
-            quarantine_row = list(row)
-            while len(quarantine_row) < len(COLUMNS):
-                quarantine_row.append('')
-            quarantine_row[score_idx] = new_score_num
-            quarantine_row[verdict_idx] = _sheet_safe(
+            # Тот же принцип, что и в ветке is_vacancy=false выше: только
+            # Оценка+Вердикт и Версия промпта, не вся строка (P1.8 аудита).
+            verdict_text = _sheet_safe(
                 str(data.get('verdict') or
                     f'Карантин добора: score {new_score_num} ниже MIN_SCORE={MIN_SCORE}'))
-            quarantine_row[ver_idx] = ENRICH_VERSION_LABEL
-            target_range = f'A{rownum}:{last_col}{rownum}'
-            with_retry(lambda row=quarantine_row, rng=target_range: ws.update(
-                [row], rng, value_input_option='USER_ENTERED'),
+            with_retry(lambda rn=rownum, sc=new_score_num, vt=verdict_text: ws.batch_update([
+                {'range': f'{score_col}{rn}:{verdict_col}{rn}', 'values': [[sc, vt]]},
+                {'range': f'{ver_col}{rn}', 'values': [[ENRICH_VERSION_LABEL]]},
+            ], value_input_option='USER_ENTERED'),
                       what="карантин строки после добора (низкий score)")
             print(f'    [добор] {url}: новый score {new_score_num} < MIN_SCORE={MIN_SCORE} - '
                   f'старая оценка заменена, строка исключена из рассылки и повторного добора')
@@ -1319,8 +1330,12 @@ def enrich_habr_descriptions(ws, today_rows):
         if not salary_unknown and new_salary_unknown:
             new_row[salary_idx] = _sheet_safe(known_salary)
         # сохраняем ручные поля существующей строки - build_row пишет для них ''
-        # (корректно для НОВОЙ строки, но здесь мы перезаписываем существующую)
-        new_row[comment_idx] = row[comment_idx] if len(row) > comment_idx else ''
+        # (корректно для НОВОЙ строки, но здесь мы перезаписываем существующую).
+        # Комментарий - свободный текст, ввожу руками - под _sheet_safe, как и
+        # остальные текстовые поля new_row (P1.8 аудита). Просмотрено - чекбокс
+        # (булево значение валидации ячейки), НЕ оборачивать апострофом - иначе
+        # значение перестанет проходить валидацию чекбокса.
+        new_row[comment_idx] = _sheet_safe(row[comment_idx]) if len(row) > comment_idx else ''
         new_row[seen_idx] = row[seen_idx] if len(row) > seen_idx else ''
 
         target_range = f'A{rownum}:{last_col}{rownum}'
@@ -1689,15 +1704,12 @@ def notify_audience(gc, ss_raw, ws_vacancies):
     # Три исхода на подписчика: 'ok' (получил всё), 'blocked' (403/chat not
     # found - подписчик мёртв НАВСЕГДА, ждать бессмысленно, это отдельная
     # категория, чистится через report_blocked_subscribers ниже), 'failed'
-    # (временный сбой сети/Telegram - именно из-за него раньше терялась
-    # доставка отдельным подписчикам: пачка помечалась отправленной, как
-    # только хотя бы ОДИН получал её целиком, и подписчик с временным сбоем
-    # эту пачку больше никогда не видел - см. AUDIT_REVIEW.md п.2). Теперь
-    # помечаем пачку отправленной, только если ни у кого не было именно
-    # 'failed' - блокированные в этот подсчёт не входят, иначе один
-    # зависший в KV заблокировавший подписчик держал бы всю рассылку
-    # неподтверждённой бесконечно.
-    blocked, sent_count, transient_failures = [], 0, 0
+    # (временный сбой сети/Telegram). Раньше ЛЮБОЙ 'failed' не давал
+    # подтвердить пачку - при систематической (не разовой сетевой) причине
+    # у ОДНОГО подписчика журнал «Аудитория» не подтверждался НИКОГДА, все
+    # остальные видели повтор той же ленты каждый прогон (P1.6 аудита). См.
+    # порог ниже, после подсчёта.
+    blocked, failed_chat_ids, sent_count, transient_failures = [], [], 0, 0
     for chat_id in subscribers:
         outcome = 'ok'
         for text in messages:
@@ -1714,25 +1726,50 @@ def notify_audience(gc, ss_raw, ws_vacancies):
             sent_count += 1
         elif outcome == 'failed':
             transient_failures += 1
+            failed_chat_ids.append(chat_id)
 
     print(f'  [аудитория] разослано {sent_count}/{len(subscribers)} подписчикам '
           f'({transient_failures} временных сбоев, {len(blocked)} заблокировали бота), '
           f'вакансий в пачке: {len(all_candidates)}')
 
-    # Пометить как отправленное можно, только если НИ У ОДНОГО подписчика не
-    # было временного сбоя (иначе повторяем всю пачку следующим прогоном -
-    # кто-то получит ленту дважды, это терпимо, а вакансия, потерянная
-    # навсегда для отдельного подписчика, - нет), И при этом реально кто-то
-    # получил (sent_count>0) либо все до единого оказались заблокированы
-    # (тогда transient_failures==0 само по себе, попытки повторять нечего).
-    # sent_count==0 без единого заблокированного - похоже на системный сбой
-    # (не тот BOT_TOKEN и т.п.): лучше повторить всю пачку следующим
-    # прогоном, чем тихо списать вакансию в архив, до которой никто не дошёл.
-    if subscribers and (transient_failures > 0 or (sent_count == 0 and not blocked)):
+    # P1.6 аудита, порог подтверждения пачки:
+    #  - 0 временных сбоев -> подтверждаем (как и раньше);
+    #  - РОВНО 1 временный сбой И хотя бы кто-то реально получил пачку ->
+    #    подтверждаем - этот один получит ленту повторно следующим прогоном
+    #    (терпимо), зато остальные не платят за него вечно;
+    #  - >= 2 временных сбоев -> НЕ подтверждаем (похоже на нечто большее,
+    #    чем единичный сбой одного адресата);
+    #  - sent_count == 0 и никто не заблокирован -> НЕ подтверждаем (похоже
+    #    на системный сбой - не тот BOT_TOKEN и т.п. - лучше повторить всю
+    #    пачку следующим прогоном, чем тихо списать вакансию в архив, до
+    #    которой никто не дошёл; при непустых subscribers это математически
+    #    подразумевает transient_failures>=1, ветка оставлена явно ради
+    #    ясности, а не потому что расширяет случаи выше);
+    #  - все заблокированы, временных сбоев нет -> подтверждаем (как и
+    #    раньше, повторять нечего).
+    # Известное ограничение, принимаем сознательно: ДВА хронически сбойных
+    # получателя снова застопорят журнал так же, как раньше стопорил один -
+    # для текущего масштаба (подписчиков мало) порог 1 достаточен.
+    not_confirmed = (
+        transient_failures >= 2
+        or (transient_failures == 1 and sent_count == 0)
+        or (sent_count == 0 and not blocked)
+    )
+    if subscribers and not_confirmed:
         print('  [аудитория] не все получатели подтверждены - не помечаю как отправленное, повтор в следующий прогон')
     else:
         append_sent(ws_log, [c['source_id'] for c in all_candidates])
         sent_ids = sent_ids | {c['source_id'] for c in all_candidates}
+
+    if failed_chat_ids:
+        # Best-effort и осознанно ПОСЛЕ решения о журнале выше - сбой самого
+        # алерта не должен влиять ни на подтверждение пачки, ни на остальной
+        # прогон. send_owner_alert сам fail-open (см. alerts.py), поэтому
+        # без дополнительного try/except - тот же способ, что уже
+        # использует collection_monitor.py для алертов такого рода.
+        send_owner_alert(
+            '⚠️ Рассылка аудитории: временный сбой доставки у '
+            f'{len(failed_chat_ids)} подписчик(ов): {", ".join(failed_chat_ids)}')
 
     if blocked:
         report_blocked_subscribers(blocked)
